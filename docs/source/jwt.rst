@@ -14,12 +14,18 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: jwcrypto.jwt.NestedJWT
+   :members:
+   :show-inheritance:
+
 Variables
 ---------
 
 .. autodata:: jwcrypto.jwt.JWTClaimsRegistry
 
 .. autodata:: jwcrypto.jwt.JWT_expect_type
+
+.. autodata:: jwcrypto.jwt.default_max_nested_payload_size
 
 Examples
 --------
@@ -53,3 +59,18 @@ Now decrypt and verify::
     >>> ST = jwt.JWT(key=key, jwt=ET.claims)
     >>> ST.claims
     '{"info":"I\'m a signed token"}'
+
+Create a nested token (signed, then encrypted) and validate it with the
+dedicated nested JWT entry point, which checks both layers explicitly::
+    >>> from jwcrypto import jwt, jwk
+    >>> sig_key = jwk.JWK(generate='oct', size=256)
+    >>> enc_key = jwk.JWK(generate='oct', size=256)
+    >>> T = jwt.NestedJWT(header={"alg": "HS256"},
+    ...                   claims={"info": "I'm a nested token"})
+    >>> T.make_nested_token(sig_key, enc_key,
+    ...                     outer_header={"alg": "A256KW",
+    ...                                   "enc": "A256CBC-HS512"})
+    >>> token = T.serialize()
+    >>> R = jwt.NestedJWT(jwt=token, outer_key=enc_key, inner_key=sig_key)
+    >>> R.claims
+    '{"info":"I\'m a nested token"}'

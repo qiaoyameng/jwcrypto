@@ -8,7 +8,7 @@ from typing_extensions import deprecated
 
 from jwcrypto.common import JWException, JWKeyNotFound
 from jwcrypto.common import json_decode, json_encode
-from jwcrypto.jwe import JWE
+from jwcrypto.jwe import JWE, InvalidJWEData
 from jwcrypto.jwe import default_allowed_algs as jwe_algs
 from jwcrypto.jwk import JWK, JWKSet
 from jwcrypto.jws import JWS
@@ -35,6 +35,11 @@ JWT_expect_type = True
    immediately refactored to deal with the change in behavior but it
    is considered deprecated and will be removed in a future release.
 """
+
+# Limit the size of the plaintext we accept from the outer JWE of a
+# nested JWT by default. This bounds both the inner token size and,
+# when compression is used, the total decompressed size.
+default_max_nested_payload_size = 256 * 1024
 
 
 class JWTExpired(JWException):
@@ -158,6 +163,25 @@ class JWTMissingKey(JWKeyNotFound):
         if exception:
             msg += ' {%s}' % str(exception)
         super(JWTMissingKey, self).__init__(msg)
+
+
+class JWTInvalidHeaderParameter(JWException):
+    """JSON Web Token header parameter is missing or invalid.
+
+    This exception is raised when a JOSE header parameter does not
+    match the expected value, for example when the 'cty' or 'typ'
+    policy of a nested JWT is not satisfied.
+    """
+
+    def __init__(self, message=None, exception=None):
+        msg = None
+        if message:
+            msg = str(message)
+        else:
+            msg = 'Invalid Header Parameter'
+        if exception:
+            msg += ' {%s}' % str(exception)
+        super(JWTInvalidHeaderParameter, self).__init__(msg)
 
 
 class JWT:
@@ -783,3 +807,282 @@ class JWT:
                f'key=None, algs={self._algs}, ' + \
                f'default_claims={self._reg_claims}, ' + \
                f'check_claims={self._check_claims})'
+
+
+class NestedJWT(JWT):
+    """Nested JSON Web Token object (RFC 7519, Section 5.2).
+
+    This object represents a nested JWT: a signed JWT (JWS) that is
+    encapsulated as the plaintext of an encrypted JWT (JWE). Only the
+    "sign, then encrypt" order is supported, and only the JWS/JWE
+    Compact Serializations are accepted.
+
+    The two layers are validated strictly in order and independently:
+    the outer JWE is authenticated first, and only then is the inner
+    JWS parsed and verified. Claims are exposed (and issuer, audience
+    and time based checks performed) only after the inner signature
+    has been successfully verified. The key used to verify the inner
+    JWS always comes from the caller provided 'inner_key' parameter;
+    header parameters of the outer JWE are never used to select the
+    inner verification key.
+    """
+
+    # A nested JWT is exactly two layers deep: a JWS inside a JWE.
+    # Deeper nesting is never attempted.
+    MAX_NESTING_DEPTH = 2
+
+    def __init__(self, header=None, claims=None, jwt=None,
+                 outer_key=None, inner_key=None,
+                 outer_algs=None, inner_algs=None,
+                 expected_outer_typ=None, expected_outer_cty='JWT',
+                 expected_inner_typ='JWT',
+                 max_payload_size=None,
+                 default_claims=None, check_claims=None):
+        """Creates a NestedJWT object.
+
+        :param header: A dict or a JSON string with the JWS Header
+         data for the inner (signed) token, used when creating a token
+         with :meth:`make_nested_token`. A 'typ' of "JWT"" is added
+         if not present.
+        :param claims: A dict or a string with the JWT Claims data,
+         used when creating a token with :meth:`make_nested_token`.
+        :param jwt: a 'raw' nested JWT token to validate. Both
+         'outer_key' and 'inner_key' must be provided when 'jwt' is.
+        :param outer_key: A (:class:`jwcrypto.jwk.JWK`) decryption key
+         for the outer JWE, or a (:class:`jwcrypto.jwk.JWKSet`) that
+         contains a key indexed by the 'kid' header of the outer JWE.
+        :param inner_key: A (:class:`jwcrypto.jwk.JWK`) verification
+         key for the inner JWS, or a (:class:`jwcrypto.jwk.JWKSet`)
+         that contains a key indexed by the 'kid' header of the inner
+         JWS. This is the only source of keys for the inner layer.
+        :param outer_algs: An optional list of allowed algorithms for
+         the outer JWE. If not provided the JWE default allowed
+         algorithms apply.
+        :param inner_algs: An optional list of allowed algorithms for
+         the inner JWS. If not provided the JWS default allowed
+         algorithms apply.
+        :param expected_outer_typ: An optional string with the expected
+         value of the 'typ' header parameter of the outer JWE. The
+         comparison is case-insensitive and ignores an optional
+         'application/' prefix. If None (default) the parameter is not
+         checked.
+        :param expected_outer_cty: An optional string with the expected
+         value of the 'cty' header parameter of the outer JWE, compared
+         like 'typ'. Defaults to "JWT" as required by RFC 7519,
+         Section 5.2. Set to None to disable the check.
+        :param expected_inner_typ: An optional string with the
+         expected value of the 'typ' header parameter of the inner JWS,
+         compared like 'typ'. Defaults to "JWT". Set to None to disable
+         the check.
+        :param max_payload_size: Maximum size in bytes of the decrypted
+         outer payload (the serialized inner token). When the outer JWE
+         uses compression this also bounds the total decompressed size.
+         Defaults to 256 KiB.
+        :param default_claims: An optional dict with default values for
+         registered claims, see :class:`JWT`.
+        :param check_claims: An optional dict of claims that must be
+         present in the validated inner token, see :class:`JWT`. Time
+         based claims ('exp', 'nbf') can be pinned to a fixed
+         reference time by providing an explicit value.
+
+        Note: if check_claims is not provided the 'exp' and 'nbf'
+        claims are checked against the current time if they are set on
+        the token but not enforced if not set.
+        """
+        self._outer_algs = outer_algs
+        self._inner_algs = inner_algs
+        self._expected_outer_typ = expected_outer_typ
+        self._expected_outer_cty = expected_outer_cty
+        self._expected_inner_typ = expected_inner_typ
+        if max_payload_size is None:
+            max_payload_size = default_max_nested_payload_size
+        self._max_payload_size = int(max_payload_size)
+        self._outer_token = None
+        self._inner_token = None
+        super(NestedJWT, self).__init__(
+            header=header, claims=claims,
+            default_claims=default_claims, check_claims=check_claims)
+        if jwt is not None:
+            self.deserialize(jwt, outer_key=outer_key, inner_key=inner_key)
+
+    @property
+    def outer_token(self):
+        """The validated outer :class:`jwcrypto.jwe.JWE` token."""
+        return self._outer_token
+
+    @property
+    def inner_token(self):
+        """The validated inner :class:`jwcrypto.jws.JWS` token."""
+        return self._inner_token
+
+    @property
+    def outer_header(self):
+        """The JOSE header of the outer JWE, as a dict."""
+        if self._outer_token is None:
+            raise KeyError("'outer_header' not set")
+        return self._outer_token.jose_header
+
+    def _reset_nested_state(self):
+        self._header = None
+        self._claims = None
+        self._token = None
+        self._outer_token = None
+        self._inner_token = None
+        self.deserializelog = None
+
+    def _check_header_parameter(self, header, name, expected, layer):
+        if expected is None:
+            return
+        actual = header.get(name)
+        if actual is None:
+            raise JWTInvalidHeaderParameter(
+                "Missing '%s' header parameter in the %s" % (name, layer))
+        if not isinstance(actual, str) or \
+                self.norm_typ(actual) != self.norm_typ(expected):
+            raise JWTInvalidHeaderParameter(
+                "Invalid '%s' header parameter in the %s. "
+                "Expected '%s' got '%s'" % (name, layer, expected, actual))
+
+    def make_nested_token(self, inner_key, outer_key, outer_header=None):
+        """Signs the claims and then encrypts the signed token.
+
+        Creates an inner JWS with the object header as its protected
+        header and the object claims as its payload, then wraps it in
+        an outer JWE. A 'cty' of "JWT" is added to the outer protected
+        header if not present, as required by RFC 7519, Section 5.2.
+
+        :param inner_key: A (:class:`jwcrypto.jwk.JWK`) signing key.
+        :param outer_key: A (:class:`jwcrypto.jwk.JWK`) encryption key.
+        :param outer_header: An optional dict with the JWE protected
+         header data. It must contain suitable 'alg' and 'enc' values.
+        """
+        inner_header = {}
+        if self._header is not None:
+            inner_header = json_decode(self._header)
+        inner_header.setdefault('typ', 'JWT')
+        inner = JWS(self.claims)
+        if self._inner_algs is not None:
+            inner.allowed_algs = self._inner_algs
+        inner.add_signature(inner_key, protected=json_encode(inner_header))
+        signed = inner.serialize(compact=True)
+
+        oh = dict(outer_header) if outer_header else {}
+        oh.setdefault('cty', 'JWT')
+        outer = JWE(signed.encode('utf-8'), protected=json_encode(oh))
+        if self._outer_algs is not None:
+            outer.allowed_algs = self._outer_algs
+        outer.add_recipient(outer_key)
+
+        self._inner_token = inner
+        self._outer_token = outer
+        self.token = outer
+
+    def deserialize(self, jwt, outer_key=None, inner_key=None):
+        """Deserialize and validate a nested JWT token.
+
+        NOTE: Destroys any current status and tries to import and
+        validate the raw token provided. If any validation step fails
+        an exception is raised and no claims or headers are exposed on
+        the object.
+
+        :param jwt: a 'raw' nested JWT token.
+        :param outer_key: A (:class:`jwcrypto.jwk.JWK`) decryption key
+         for the outer JWE, or a (:class:`jwcrypto.jwk.JWKSet`) that
+         contains a key indexed by the 'kid' header of the outer JWE.
+        :param inner_key: A (:class:`jwcrypto.jwk.JWK`) verification
+         key for the inner JWS, or a (:class:`jwcrypto.jwk.JWKSet`)
+         that contains a key indexed by the 'kid' header of the inner
+         JWS.
+
+        :raises ValueError: if the token is not a nested JWT in the
+         JWE Compact Serialization, or if the keys are not provided.
+        """
+        if outer_key is None or inner_key is None:
+            raise ValueError("Both 'outer_key' and 'inner_key' are "
+                             "required to validate a nested JWT")
+        self._reset_nested_state()
+        try:
+            self._deserialize_nested(jwt, outer_key, inner_key)
+        except Exception:
+            # Never leave partially validated, potentially attacker
+            # controlled state behind on failure.
+            self._reset_nested_state()
+            raise
+
+    def _deserialize_nested(self, jwt, outer_key, inner_key):
+        # The outer layer must be a JWE in Compact Serialization. The
+        # format is never guessed: anything else is rejected outright
+        # instead of trying other interpretations.
+        if self._is_json_serialization(jwt):
+            raise ValueError("Only the JWE Compact Serialization is "
+                             "allowed for the outer token of a nested "
+                             "JWT, but a JSON Serialization was provided")
+        if jwt.count('.') != 4:
+            raise ValueError("A nested JWT must have an outer JWE in "
+                             "Compact Serialization (5 parts)")
+
+        outer = JWE()
+        if self._outer_algs is not None:
+            outer.allowed_algs = self._outer_algs
+        outer.deserialize(jwt)
+        # max_plaintext bounds the decompressed size when the outer
+        # JWE uses compression.
+        outer.decrypt(outer_key, max_plaintext=self._max_payload_size)
+
+        # The outer layer is authenticated at this point. Enforce the
+        # typ/cty policy before looking at the content.
+        outer_header = outer.jose_header
+        self._check_header_parameter(outer_header, 'cty',
+                                     self._expected_outer_cty,
+                                     'outer JWE')
+        self._check_header_parameter(outer_header, 'typ',
+                                     self._expected_outer_typ,
+                                     'outer JWE')
+
+        payload = outer.payload
+        if len(payload) > self._max_payload_size:
+            raise InvalidJWEData(
+                'Nested JWT payload exceeds maximum allowed size'
+                f' ({self._max_payload_size})')
+        if isinstance(payload, bytes):
+            inner_jwt = payload.decode('utf-8')
+        else:
+            inner_jwt = payload
+
+        # The inner layer must be a JWS in Compact Serialization. This
+        # also enforces the nesting depth limit: a nested JWT is
+        # exactly a JWS inside a JWE, anything else (including a
+        # further nested token) is rejected.
+        if self._is_json_serialization(inner_jwt) or \
+                inner_jwt.count('.') != 2:
+            raise ValueError("The inner token of a nested JWT must be "
+                             "a JWS in Compact Serialization (3 parts)")
+
+        inner = JWS()
+        if self._inner_algs is not None:
+            inner.allowed_algs = self._inner_algs
+        inner.deserialize(inner_jwt)
+        # The verification key comes exclusively from the caller
+        # provided inner_key; the outer header is never consulted to
+        # select it.
+        inner.verify(inner_key)
+
+        # The inner signature is verified at this point.
+        inner_header = inner.jose_header
+        self._check_header_parameter(inner_header, 'typ',
+                                     self._expected_inner_typ,
+                                     'inner JWS')
+
+        claims = inner.payload
+        if isinstance(claims, bytes):
+            claims = claims.decode('utf-8')
+
+        # Both layers are validated; only now expose the token, the
+        # headers and the claims, and run the claims checks (issuer,
+        # audience, expiration, etc).
+        self._inner_token = inner
+        self._outer_token = outer
+        self.token = outer
+        self.header = inner_header
+        self.claims = claims
+        self._check_provided_claims()

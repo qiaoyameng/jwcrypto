@@ -2219,6 +2219,221 @@ class TestJWT(unittest.TestCase):
         jwt.JWT(jwt=token, key=key)
 
 
+# Fixed reference time used by the nested JWT tests so that time based
+# claims checks are deterministic.
+NESTED_NOW = 1700000000
+
+NESTED_CLAIMS = {'iss': 'nested-issuer',
+                 'sub': 'nested-subject',
+                 'aud': 'nested-audience',
+                 'exp': NESTED_NOW + 600,
+                 'nbf': NESTED_NOW - 10,
+                 'iat': NESTED_NOW - 10,
+                 'jti': 'nested-id'}
+
+NESTED_CHECK_CLAIMS = {'iss': 'nested-issuer',
+                       'aud': 'nested-audience',
+                       'exp': NESTED_NOW,
+                       'nbf': NESTED_NOW}
+
+NESTED_INNER_ALGS = ['HS256']
+NESTED_OUTER_ALGS = ['A256KW', 'A256CBC-HS512']
+
+
+class TestNestedJWT(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sig_key = jwk.JWK.generate(kty='oct', size=256, kid='sig-key')
+        cls.enc_key = jwk.JWK.generate(kty='oct', size=256, kid='enc-key')
+
+    def _make_token(self, claims=None, inner_header=None,
+                    outer_header=None, sig_key=None, enc_key=None):
+        t = jwt.NestedJWT(
+            header=inner_header or {'alg': 'HS256'},
+            claims=claims if claims is not None else dict(NESTED_CLAIMS),
+            inner_algs=NESTED_INNER_ALGS, outer_algs=NESTED_OUTER_ALGS)
+        t.make_nested_token(
+            sig_key or self.sig_key, enc_key or self.enc_key,
+            outer_header=outer_header or {'alg': 'A256KW',
+                                          'enc': 'A256CBC-HS512'})
+        return t.serialize()
+
+    def _validate(self, token, **kwargs):
+        params = dict(outer_key=self.enc_key, inner_key=self.sig_key,
+                      outer_algs=NESTED_OUTER_ALGS,
+                      inner_algs=NESTED_INNER_ALGS,
+                      check_claims=dict(NESTED_CHECK_CLAIMS))
+        params.update(kwargs)
+        return jwt.NestedJWT(jwt=token, **params)
+
+    def _encrypt_payload(self, payload, outer_header=None, enc_key=None):
+        oh = outer_header or {'alg': 'A256KW', 'enc': 'A256CBC-HS512',
+                              'cty': 'JWT'}
+        e = jwe.JWE(payload.encode('utf-8'), protected=json_encode(oh))
+        e.add_recipient(enc_key or self.enc_key)
+        return e.serialize(compact=True)
+
+    def test_roundtrip(self):
+        token = self._make_token()
+        t = self._validate(token)
+        self.assertEqual(json_decode(t.claims), NESTED_CLAIMS)
+        self.assertEqual(json_decode(t.header)['typ'], 'JWT')
+        self.assertEqual(t.outer_header['cty'], 'JWT')
+        self.assertIsInstance(t.inner_token, jws.JWS)
+        self.assertIsInstance(t.outer_token, jwe.JWE)
+
+    def test_roundtrip_with_keysets(self):
+        token = self._make_token()
+        sig_set = jwk.JWKSet()
+        sig_set.add(self.sig_key)
+        enc_set = jwk.JWKSet()
+        enc_set.add(self.enc_key)
+        t = self._validate(token, outer_key=enc_set, inner_key=sig_set)
+        self.assertEqual(json_decode(t.claims), NESTED_CLAIMS)
+
+    def test_inner_unsigned_fails(self):
+        # Replace the inner JWS with an unsigned (alg: none) JWT and
+        # encrypt it with the correct outer key.
+        header = base64url_encode(json_encode({'alg': 'none',
+                                               'typ': 'JWT'}))
+        payload = base64url_encode(json_encode(NESTED_CLAIMS))
+        unsigned = header + '.' + payload + '.'
+        token = self._encrypt_payload(unsigned)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            self._validate(token)
+
+    def test_reversed_layers_fail(self):
+        # Encrypt-then-sign: the outer layer is a JWS, not a JWE.
+        inner_jwe = self._encrypt_payload(json_encode(NESTED_CLAIMS))
+        s = jws.JWS(inner_jwe.encode('utf-8'))
+        s.add_signature(self.sig_key,
+                        protected=json_encode({'alg': 'HS256'}))
+        token = s.serialize(compact=True)
+        with self.assertRaises(ValueError):
+            self._validate(token)
+        # A plain signed JWT is not a nested JWT either.
+        plain = jwt.JWT(header={'alg': 'HS256'}, claims=NESTED_CLAIMS)
+        plain.make_signed_token(self.sig_key)
+        with self.assertRaises(ValueError):
+            self._validate(plain.serialize())
+
+    def test_valid_encryption_bad_signature_fails(self):
+        # Inner JWS signed with an unrelated key, outer JWE perfectly
+        # valid and authenticated.
+        attacker_key = jwk.JWK.generate(kty='oct', size=256)
+        token = self._make_token(sig_key=attacker_key)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            self._validate(token)
+
+    def test_failure_exposes_no_claims(self):
+        attacker_key = jwk.JWK.generate(kty='oct', size=256)
+        token = self._make_token(sig_key=attacker_key)
+        t = jwt.NestedJWT(inner_algs=NESTED_INNER_ALGS,
+                          outer_algs=NESTED_OUTER_ALGS)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            t.deserialize(token, outer_key=self.enc_key,
+                          inner_key=self.sig_key)
+        # No partially validated state may leak to the caller.
+        with self.assertRaises(KeyError):
+            t.claims  # pylint: disable=pointless-statement
+        with self.assertRaises(KeyError):
+            t.header  # pylint: disable=pointless-statement
+        with self.assertRaises(KeyError):
+            t.outer_header  # pylint: disable=pointless-statement
+        self.assertIsNone(t.token)
+        self.assertIsNone(t.inner_token)
+        self.assertIsNone(t.outer_token)
+
+    def test_missing_keys_rejected(self):
+        token = self._make_token()
+        with self.assertRaises(ValueError):
+            jwt.NestedJWT(jwt=token, outer_key=self.enc_key)
+        with self.assertRaises(ValueError):
+            jwt.NestedJWT(jwt=token, inner_key=self.sig_key)
+
+    def test_alg_restrictions(self):
+        token = self._make_token()
+        # Outer algorithm not in the allowed set.
+        with self.assertRaises(jwe.InvalidJWEData):
+            self._validate(token, outer_algs=['A128KW', 'A128CBC-HS256'])
+        # Inner algorithm not in the allowed set.
+        with self.assertRaises(jws.InvalidJWSSignature):
+            self._validate(token, inner_algs=['HS512'])
+
+    def test_cty_typ_policy(self):
+        # Missing cty on the outer JWE is rejected by default.
+        inner = jws.JWS(json_encode(NESTED_CLAIMS))
+        inner.add_signature(self.sig_key,
+                            protected=json_encode({'alg': 'HS256',
+                                                   'typ': 'JWT'}))
+        signed = inner.serialize(compact=True)
+        token = self._encrypt_payload(
+            signed, outer_header={'alg': 'A256KW', 'enc': 'A256CBC-HS512'})
+        with self.assertRaises(jwt.JWTInvalidHeaderParameter):
+            self._validate(token)
+        # A wrong cty value is rejected too.
+        token = self._encrypt_payload(
+            signed, outer_header={'alg': 'A256KW', 'enc': 'A256CBC-HS512',
+                                  'cty': 'text/plain'})
+        with self.assertRaises(jwt.JWTInvalidHeaderParameter):
+            self._validate(token)
+        # Wrong typ on the inner JWS is rejected.
+        token = self._make_token(inner_header={'alg': 'HS256',
+                                               'typ': 'at+jwt'})
+        with self.assertRaises(jwt.JWTInvalidHeaderParameter):
+            self._validate(token)
+        # Explicitly configured expectations are honored.
+        token = self._make_token(
+            inner_header={'alg': 'HS256', 'typ': 'example+jwt'},
+            outer_header={'alg': 'A256KW', 'enc': 'A256CBC-HS512',
+                          'cty': 'JWT', 'typ': 'nested+jwt'})
+        t = self._validate(token, expected_inner_typ='example+jwt',
+                           expected_outer_typ='nested+jwt')
+        self.assertEqual(json_decode(t.claims), NESTED_CLAIMS)
+
+    def test_payload_size_limit(self):
+        big_claims = dict(NESTED_CLAIMS)
+        big_claims['padding'] = 'x' * 4096
+        token = self._make_token(claims=big_claims)
+        # A sufficiently large limit works.
+        t = self._validate(token, max_payload_size=1024 * 1024)
+        self.assertEqual(json_decode(t.claims)['padding'], 'x' * 4096)
+        # A limit smaller than the inner token fails.
+        with self.assertRaises(jwe.InvalidJWEData):
+            self._validate(token, max_payload_size=128)
+
+    def test_json_serialization_rejected(self):
+        # The JWE JSON Serialization is never accepted as outer layer.
+        e = jwe.JWE(json_encode(NESTED_CLAIMS).encode('utf-8'),
+                    protected=json_encode({'alg': 'A256KW',
+                                           'enc': 'A256CBC-HS512',
+                                           'cty': 'JWT'}))
+        e.add_recipient(self.enc_key)
+        token = e.serialize(compact=False)
+        with self.assertRaises(ValueError):
+            self._validate(token)
+
+    def test_claims_checked_after_inner_verify(self):
+        # Expired tokens are rejected with the fixed reference time.
+        expired = dict(NESTED_CLAIMS)
+        expired['exp'] = NESTED_NOW - 100
+        token = self._make_token(claims=expired)
+        with self.assertRaises(jwt.JWTExpired):
+            self._validate(token)
+        # Wrong issuer is rejected.
+        token = self._make_token()
+        bad_check = dict(NESTED_CHECK_CLAIMS)
+        bad_check['iss'] = 'other-issuer'
+        with self.assertRaises(jwt.JWTInvalidClaimValue):
+            self._validate(token, check_claims=bad_check)
+        # Wrong audience is rejected.
+        bad_check = dict(NESTED_CHECK_CLAIMS)
+        bad_check['aud'] = 'other-audience'
+        with self.assertRaises(jwt.JWTInvalidClaimValue):
+            self._validate(token, check_claims=bad_check)
+
+
 class ConformanceTests(unittest.TestCase):
 
     def test_unknown_key_params(self):

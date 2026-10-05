@@ -49,6 +49,15 @@ default_allowed_algs = [
     'A128GCM', 'A192GCM', 'A256GCM']
 """Default allowed algorithms"""
 
+default_rewrap_algs = [
+    'RSA1_5', 'RSA-OAEP', 'RSA-OAEP-256',
+    'A128KW', 'A192KW', 'A256KW',
+    'ECDH-ES+A128KW', 'ECDH-ES+A192KW', 'ECDH-ES+A256KW',
+    'A128GCMKW', 'A192GCMKW', 'A256GCMKW',
+    'PBES2-HS256+A128KW', 'PBES2-HS384+A192KW', 'PBES2-HS512+A256KW',
+]
+"""Key management algorithms that can wrap an existing CEK"""
+
 
 # These have been moved to jwcrypto.common, maintain here for backwards compat
 InvalidCEKeyLength = common.InvalidCEKeyLength
@@ -93,6 +102,7 @@ class JWE:
                 self.plaintext = plaintext.encode('utf-8')
         self.cek = None
         self.decryptlog = None
+        self._matched_alg = None
         if aad:
             self.objects['aad'] = aad
         if protected:
@@ -240,6 +250,9 @@ class JWE:
         if 'ciphertext' not in self.objects:
             self._encrypt(alg, enc, jh)
 
+        self._store_recipient(rec)
+
+    def _store_recipient(self, rec):
         if 'recipients' in self.objects:
             self.objects['recipients'].append(rec)
         elif self.flattened:
@@ -360,7 +373,81 @@ class JWE:
         data = enc.decrypt(cek, aad, iv, ciphertext, tag)
         self.decryptlog.append('Success')
         self.cek = cek
+        self._matched_alg = alg.name
         return data
+
+    def rewrap(self, old_key, new_key, header=None):
+        """Re-wrap the JWE for a new recipient without re-encrypting.
+
+        Verifies the token with an existing recipient's key, recovers
+        the Content Encryption Key (CEK), and adds a new recipient by
+        wrapping the same CEK for the new key. The protected header,
+        the external AAD, the ciphertext, the IV and the authentication
+        tag are left untouched, byte for byte.
+
+        Only key management algorithms that can safely wrap an existing
+        CEK (see :data:`default_rewrap_algs`) are allowed, for both the
+        original and the new recipient. Algorithms like 'dir' or
+        'ECDH-ES', which would require generating a new CEK and
+        re-encrypting the payload, are rejected.
+
+        :param old_key: The (:class:`jwcrypto.jwk.JWK`) key of an
+         existing recipient, used to authenticate the token and
+         recover the CEK.
+        :param new_key: The (:class:`jwcrypto.jwk.JWK`) key of the new
+         recipient.
+        :param header: An optional JSON string or dict with the
+         per-recipient header for the new recipient. It must not
+         conflict with the shared (protected or unprotected) headers.
+
+        :raises InvalidJWEOperation: if there is no ciphertext to
+         re-wrap, or if either the original or the new recipient's
+         algorithm cannot reuse the existing CEK.
+        :raises InvalidJWEData: if authentication with `old_key` fails
+         (no new recipient is published in this case), or if the new
+         recipient header conflicts with the shared headers.
+        """
+        if 'ciphertext' not in self.objects:
+            raise InvalidJWEOperation("No available ciphertext")
+
+        # Authenticate the token and recover the CEK. If verification
+        # fails this raises before any new recipient is published.
+        self.decrypt(old_key)
+
+        if self._matched_alg not in default_rewrap_algs:
+            raise InvalidJWEOperation(
+                'Cannot re-wrap a token that uses the "%s" algorithm' %
+                self._matched_alg)
+
+        if isinstance(header, dict):
+            header = json_encode(header)
+
+        # Raises if the new recipient header conflicts with shared ones
+        jh = self._get_jose_header(header)
+        alg, enc = self._get_alg_enc_from_headers(jh)
+
+        if alg.name not in default_rewrap_algs:
+            raise InvalidJWEOperation(
+                'Algorithm "%s" cannot wrap an existing CEK' % alg.name)
+
+        wrapped = alg.wrap(new_key, enc.wrap_key_size, self.cek, jh)
+        if wrapped['cek'] != self.cek:
+            # Defensive check: never allow a silent CEK change, which
+            # would require re-encrypting the payload.
+            raise InvalidJWEOperation(
+                'Algorithm "%s" cannot reuse the existing CEK' % alg.name)
+
+        rec = {}
+        if header:
+            rec['header'] = header
+        if 'ek' in wrapped:
+            rec['encrypted_key'] = wrapped['ek']
+        if 'header' in wrapped:
+            h = json_decode(rec.get('header', '{}'))
+            nh = self._merge_headers(h, wrapped['header'])
+            rec['header'] = json_encode(nh)
+
+        self._store_recipient(rec)
 
     # FIXME: allow to specify which algorithms to accept as valid
     def _decrypt(self, key, ppe, max_plaintext=default_max_plaintext_size):
@@ -458,6 +545,7 @@ class JWE:
         if 'ciphertext' not in self.objects:
             raise InvalidJWEOperation("No available ciphertext")
         self.decryptlog = []
+        self._matched_alg = None
         missingkey = False
 
         if 'recipients' in self.objects:
@@ -505,6 +593,7 @@ class JWE:
         self.objects = {}
         self.plaintext = None
         self.cek = None
+        self._matched_alg = None
 
         o = {}
         try:

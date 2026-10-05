@@ -1698,6 +1698,103 @@ class TestJWE(unittest.TestCase):
         self.assertNotIn('recipients', e.objects)
         self.assertNotIn('recipients', e.serialize())
 
+    def check_rewrap(self, plaintext, aad, old_alg, old_key, new_alg,
+                     new_key):
+        e = jwe.JWE(plaintext, protected={'enc': 'A256GCM'}, aad=aad)
+        e.add_recipient(old_key, header={'alg': old_alg, 'kid': 'old'})
+        token = e.serialize()
+
+        r = jwe.JWE()
+        r.deserialize(token)
+        r.rewrap(old_key, new_key,
+                 header={'alg': new_alg, 'kid': 'new'})
+        rewrapped = r.serialize()
+
+        # The payload must not be re-encrypted: ciphertext, iv, tag,
+        # protected header and AAD must be identical, byte for byte
+        before = json_decode(token)
+        after = json_decode(rewrapped)
+        for field in ('protected', 'aad', 'iv', 'ciphertext', 'tag'):
+            self.assertEqual(before[field], after[field])
+        self.assertEqual(len(after['recipients']), 2)
+
+        # Both the old and the new key must retrieve the same plaintext
+        d_old = jwe.JWE()
+        d_old.deserialize(rewrapped, old_key)
+        self.assertEqual(d_old.payload, plaintext)
+        d_new = jwe.JWE()
+        d_new.deserialize(rewrapped, new_key)
+        self.assertEqual(d_new.payload, plaintext)
+
+    def test_rewrap_aeskw(self):
+        old_key = jwk.JWK.generate(kty='oct', size=256)
+        new_key = jwk.JWK.generate(kty='oct', size=128)
+        self.check_rewrap(b'rewrap me', b'external authenticated data',
+                          'A256KW', old_key, 'A128KW', new_key)
+
+    def test_rewrap_rsa(self):
+        old_key = jwk.JWK.generate(kty='RSA', size=2048)
+        new_key = jwk.JWK.generate(kty='RSA', size=2048)
+        self.check_rewrap(b'rewrap me', b'external authenticated data',
+                          'RSA-OAEP', old_key, 'RSA-OAEP-256', new_key)
+
+    def test_rewrap_bad_key_publishes_nothing(self):
+        old_key = jwk.JWK.generate(kty='oct', size=256)
+        new_key = jwk.JWK.generate(kty='oct', size=128)
+        wrong_key = jwk.JWK.generate(kty='oct', size=256)
+        e = jwe.JWE(b'secret', protected={'enc': 'A256GCM'},
+                    aad=b'aad')
+        e.add_recipient(old_key, header={'alg': 'A256KW'})
+        token = e.serialize()
+
+        r = jwe.JWE()
+        r.deserialize(token)
+        with self.assertRaises(jwe.InvalidJWEData):
+            r.rewrap(wrong_key, new_key, header={'alg': 'A128KW'})
+        # No new recipient may be published on authentication failure
+        self.assertNotIn('recipients', r.objects)
+        self.assertEqual(json_decode(r.serialize()), json_decode(token))
+
+    def test_rewrap_rejects_unsafe_algs(self):
+        old_key = jwk.JWK.generate(kty='oct', size=256)
+        new_key = jwk.JWK.generate(kty='oct', size=256)
+        e = jwe.JWE(b'secret', protected={'enc': 'A256GCM'})
+        e.add_recipient(old_key, header={'alg': 'A256KW'})
+        token = e.serialize()
+
+        # 'dir' and 'ECDH-ES' cannot wrap an existing CEK
+        for alg in ('dir', 'ECDH-ES'):
+            r = jwe.JWE()
+            r.deserialize(token)
+            with self.assertRaises(jwe.InvalidJWEOperation):
+                r.rewrap(old_key, new_key, header={'alg': alg})
+            self.assertNotIn('recipients', r.objects)
+
+        # A token originally encrypted with 'dir' cannot be re-wrapped
+        d = jwe.JWE(b'secret',
+                    protected={'alg': 'dir', 'enc': 'A256GCM'})
+        d.add_recipient(old_key)
+        r = jwe.JWE()
+        r.deserialize(d.serialize())
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            r.rewrap(old_key, new_key, header={'alg': 'A256KW'})
+        self.assertNotIn('recipients', r.objects)
+
+    def test_rewrap_conflicting_header(self):
+        old_key = jwk.JWK.generate(kty='oct', size=256)
+        new_key = jwk.JWK.generate(kty='oct', size=256)
+        e = jwe.JWE(b'secret', protected={'enc': 'A256GCM'})
+        e.add_recipient(old_key, header={'alg': 'A256KW'})
+        token = e.serialize()
+
+        r = jwe.JWE()
+        r.deserialize(token)
+        # 'enc' is already in the shared protected header
+        with self.assertRaises(jwe.InvalidJWEData):
+            r.rewrap(old_key, new_key,
+                     header={'alg': 'A256KW', 'enc': 'A128GCM'})
+        self.assertNotIn('recipients', r.objects)
+
 
 MMA_vector_key = jwk.JWK(**E_A2_key)
 MMA_vector_ok_cek =  \

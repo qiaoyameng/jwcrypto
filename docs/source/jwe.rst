@@ -19,6 +19,8 @@ Variables
 
 .. autodata:: jwcrypto.jwe.default_allowed_algs
 
+.. autodata:: jwcrypto.jwe.default_rewrap_algs
+
 Exceptions
 ----------
 

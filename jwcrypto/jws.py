@@ -183,6 +183,103 @@ class JWSCore:
         return True
 
 
+class JWSStreamCore:
+    """The inner JWS Core object for streaming operations.
+
+    Like JWSCore, but the payload is fed incrementally as a sequence
+    of chunks instead of being held in memory in full. Only algorithms
+    that can be safely processed incrementally according to their
+    definition can be used through this interface; any other algorithm
+    is rejected.
+
+    This object SHOULD NOT be used directly, the JWS object should be
+    used instead as JWS perform necessary checks on the validity of
+    the object and requested operations.
+    """
+
+    def __init__(self, alg, key, protected, algs=None):
+        """Core streaming JWS token handling.
+
+        :param alg: The algorithm used to produce the signature.
+            See RFC 7518
+        :param key: A (:class:`jwcrypto.jwk.JWK`) key.
+        :param protected: The base64url-encoded protected header. It
+            must already carry the RFC 7797 '"b64": false' and 'crit'
+            parameters.
+        :param algs: An optional list of allowed algorithms
+
+        :raises InvalidJWSOperation: if the algorithm is not allowed.
+        :raises InvalidJWAAlgorithm: if the algorithm is not valid, is
+            unknown or otherwise not yet implemented.
+        """
+        if algs is None:
+            algs = default_allowed_algs
+        if alg not in algs:
+            raise InvalidJWSOperation('Algorithm not allowed')
+        self.alg = alg
+        self.engine = JWA.signing_alg(alg)
+        self.key = key
+        self.protected = protected
+
+    def _context(self, operation):
+        try:
+            if operation == 'sign':
+                ctx = self.engine.stream_signer(self.key)
+            else:
+                ctx = self.engine.stream_verifier(self.key)
+        except NotImplementedError as e:
+            raise InvalidJWSOperation(
+                'Algorithm "%s" cannot be used for streaming '
+                'operations' % self.alg) from e
+        # The JWS Signing Input is ASCII(BASE64URL(protected)) || '.'
+        # || payload; feed the constant prefix before any payload chunk
+        ctx.update(self.protected.encode('utf-8'))
+        ctx.update(b'.')
+        return ctx
+
+    def signer(self):
+        """Returns an incremental signing context.
+
+        The context is primed with the protected header portion of the
+        JWS Signing Input; payload chunks can be fed via its update()
+        method and the signature obtained via its finalize() method.
+
+        :raises ValueError: if the key is not a (:class:`jwcrypto.jwk.JWK`)
+        :raises InvalidJWSOperation: if the algorithm cannot be
+            processed incrementally.
+        """
+        if not isinstance(self.key, JWK):
+            raise ValueError('key is not a JWK object')
+        return self._context('sign')
+
+    def verifier(self):
+        """Returns an incremental verification context.
+
+        The context is primed with the protected header portion of the
+        JWS Signing Input; payload chunks can be fed via its update()
+        method and the signature checked via its verify() method.
+
+        :raises InvalidJWSOperation: if the algorithm cannot be
+            processed incrementally.
+        """
+        return self._context('verify')
+
+
+def _payload_chunks(chunks):
+    """Yields payload chunks as bytes from an iterator of bytes-like
+    objects.
+
+    :raises TypeError: if a chunk is not a bytes-like object.
+    """
+    for chunk in chunks:
+        if isinstance(chunk, bytes):
+            yield chunk
+        elif isinstance(chunk, (bytearray, memoryview)):
+            yield bytes(chunk)
+        else:
+            raise TypeError('Payload chunks must be bytes-like objects')
+
+
 class JWS:
     """JSON Web Signature object
 
@@ -566,7 +663,9 @@ class JWS:
             o['protected'] = protected
         if header:
             o['header'] = h
+        self._store_signature(o, b64)
 
+    def _store_signature(self, o, b64):
         if 'signatures' in self.objects:
             self.objects['signatures'].append(o)
         elif 'signature' in self.objects:
@@ -583,6 +682,216 @@ class JWS:
         else:
             self.objects.update(o)
             self.objects['b64'] = b64
+
+    def sign_stream(self, key, chunks, alg=None, protected=None,
+                    header=None):
+        """Signs a detached payload provided as a stream of chunks.
+
+        Implements RFC 7797 unencoded payload signing: the protected
+        header is forced to carry '"b64": false' and a 'crit' entry
+        for 'b64', and the payload bytes are used as-is in the JWS
+        Signing Input. The payload is never stored on the object, so
+        the resulting token is a detached JWS.
+
+        Only algorithms that can be safely processed incrementally
+        according to their definition are supported; any other
+        algorithm is rejected.
+
+        :param key: A (:class:`jwcrypto.jwk.JWK`) key appropriate for
+         the "alg" provided.
+        :param chunks: An iterator of bytes-like objects that yields
+         the payload content, e.g. read from a large file.
+        :param alg: An optional algorithm name. If already provided as
+         an element of the protected or unprotected header it can be
+         safely omitted.
+        :param protected: The Protected Header (optional). The 'b64'
+         parameter is set to false and added to 'crit' automatically.
+        :param header: The Unprotected Header (optional)
+
+        :raises InvalidJWSObject: if invalid headers are provided.
+        :raises InvalidJWSOperation: if the algorithm cannot be
+         processed incrementally.
+        :raises ValueError: if the key is not a (:class:`jwcrypto.jwk.JWK`)
+         or the algorithm is missing or mismatched.
+        :raises TypeError: if a chunk is not a bytes-like object.
+        """
+
+        if protected:
+            if isinstance(protected, dict):
+                protected = json_encode(protected)
+            # Make sure p is always a deep copy of the dict
+            p = json_decode(protected)
+        else:
+            p = dict()
+
+        # RFC 7797: streaming implies an unencoded, detached payload
+        if 'b64' in p:
+            if p['b64'] is not False:
+                raise InvalidJWSObject(
+                    'Streaming operations require "b64" to be false')
+        else:
+            p['b64'] = False
+        crit = p.get('crit', [])
+        if 'b64' not in crit:
+            crit.append('b64')
+        p['crit'] = crit
+        protected = json_encode(p)
+
+        if 'b64' in self.objects:
+            if self.objects['b64'] is not False:
+                raise InvalidJWSObject('Mixed b64 headers on signatures')
+
+        h = None
+        if header:
+            if isinstance(header, dict):
+                header = json_encode(header)
+            # Make sure h is always a deep copy of the dict
+            h = json_decode(header)
+
+        p = self._merge_check_headers(p, h)
+
+        if 'alg' in p:
+            if alg is None:
+                alg = p['alg']
+            elif alg != p['alg']:
+                raise ValueError('"alg" value mismatch, specified "alg" '
+                                 'does not match JOSE header value')
+
+        if alg is None:
+            raise ValueError('"alg" not specified')
+
+        c = JWSStreamCore(alg, key, base64url_encode(protected),
+                          self.allowed_algs)
+        signer = c.signer()
+        # Nothing is stored on the object until the whole payload has
+        # been consumed and signed, so a failing source cannot leave
+        # a partial or valid-looking state behind
+        for chunk in _payload_chunks(chunks):
+            signer.update(chunk)
+        signature = signer.finalize()
+
+        o = {
+            'signature': signature,
+            'valid': True,
+            'protected': protected,
+        }
+        if header:
+            o['header'] = h
+        # The payload is detached: it is never stored on the object
+        self.objects.pop('payload', None)
+        self._store_signature(o, False)
+
+    def _stream_verify_key(self, key, chk_hdrs):
+        if isinstance(key, JWK):
+            return key
+        if isinstance(key, JWKSet):
+            if 'kid' in chk_hdrs:
+                keys = key.get_keys(chk_hdrs['kid'])
+                if not keys:
+                    raise JWKeyNotFound('Key ID {} not in key set'.format(
+                                        chk_hdrs['kid']))
+            else:
+                keys = key['keys']
+            if len(keys) != 1:
+                raise JWKeyNotFound(
+                    'Streaming verification requires exactly one key')
+            return tuple(keys)[0]
+        raise ValueError("Unrecognized key type")
+
+    def verify_stream(self, key, chunks, alg=None):
+        """Verifies a detached JWS against a stream of payload chunks.
+
+        The token must have been deserialized (or signed) beforehand
+        and must use an unencoded payload (RFC 7797, '"b64": false'
+        in the protected header). The payload bytes are fed to the
+        verification incrementally, so arbitrarily large payloads can
+        be verified without holding them in memory.
+
+        Only algorithms that can be safely processed incrementally
+        according to their definition are supported; any other
+        algorithm is rejected.
+
+        :param key: A (:class:`jwcrypto.jwk.JWK`) verification key or
+         a (:class:`jwcrypto.jwk.JWKSet`) that contains a key indexed
+         by the 'kid' header.
+        :param chunks: An iterator of bytes-like objects that yields
+         the detached payload content.
+        :param alg: The signing algorithm (optional). Usually the
+         algorithm is known as it is provided with the JOSE Headers
+         of the token.
+
+        :raises InvalidJWSSignature: if the verification fails or the
+         chunk source raises an error or yields invalid chunks.
+        :raises InvalidJWSOperation: if the token does not use an
+         unencoded payload, carries multiple signatures, or uses an
+         algorithm that cannot be processed incrementally.
+        :raises JWKeyNotFound: if key is a JWKSet and the key is not
+         found.
+
+        :return: Returns True or raises an Exception
+        :rtype: `bool`
+        """
+        self.verifylog = []
+        self.objects['valid'] = False
+        obj = self.objects
+        if 'signatures' in obj:
+            raise InvalidJWSOperation(
+                'Streaming verification supports only tokens with a '
+                'single signature')
+        if 'signature' not in obj:
+            raise InvalidJWSSignature('No signatures available')
+
+        p = {}
+        protected = obj.get('protected', None)
+        if protected is not None:
+            p = json_decode(protected)
+            if not isinstance(p, dict):
+                raise InvalidJWSSignature('Invalid Protected header')
+        if p.get('b64', True) is not False:
+            raise InvalidJWSOperation(
+                'Streaming verification requires an unencoded payload '
+                '("b64": false)')
+
+        header = obj.get('header', None)
+        if header is not None and not isinstance(header, dict):
+            raise InvalidJWSSignature('Invalid Unprotected header')
+
+        # Merge and check (critical) headers
+        chk_hdrs = self._merge_check_headers(p, header)
+        for hdr in chk_hdrs:
+            if hdr in self.header_registry:
+                if not self.header_registry.check_header(hdr, self):
+                    raise InvalidJWSSignature('Failed header check')
+
+        # check 'alg' is present
+        if alg is None and 'alg' not in p:
+            raise InvalidJWSSignature('No "alg" in headers')
+        if alg:
+            if 'alg' in p and alg != p['alg']:
+                raise InvalidJWSSignature(
+                    '"alg" mismatch, requested'
+                    f''' "{alg}", found "{p['alg']}"'''
+                )
+            resulting_alg = alg
+        else:
+            resulting_alg = p['alg']
+
+        vkey = self._stream_verify_key(key, chk_hdrs)
+
+        c = JWSStreamCore(resulting_alg, vkey,
+                          base64url_encode(protected),
+                          self._allowed_algs)
+        try:
+            verifier = c.verifier()
+            for chunk in _payload_chunks(chunks):
+                verifier.update(chunk)
+            verifier.verify(obj['signature'])
+        except Exception as e:  # pylint: disable=broad-except
+            self.verifylog.append('Failed: [%s]' % repr(e))
+            raise InvalidJWSSignature('Verification failed') from e
+        self.verifylog.append("Success")
+        obj['valid'] = True
+        return True
 
     def serialize(self, compact=False):
         """Serializes the object into a JWS token.

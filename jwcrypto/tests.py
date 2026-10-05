@@ -2550,6 +2550,309 @@ class TestUnencodedPayload(unittest.TestCase):
                             protected=rfc7797_u_header)
 
 
+class ControlledChunkSource:
+    """A chunk source that only supports iteration.
+
+    It has no read(), seek() or any other file-like method, so code
+    consuming it cannot require seeking, and it records every chunk it
+    yields so tests can check how the payload was consumed.
+    """
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.yielded = []
+
+    def __iter__(self):
+        for chunk in self.chunks:
+            self.yielded.append(chunk)
+            yield chunk
+
+
+class FailingChunkSource:
+    """A chunk source that raises an error mid-stream."""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    def __iter__(self):
+        yield from self.chunks
+        raise RuntimeError('source blew up')
+
+
+def split_payload(payload, size):
+    return [payload[i:i + size] for i in range(0, len(payload), size)]
+
+
+class TestJWSStreaming(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.payload = (b'\x00.\x00binary payload\x00.with.dots.'
+                       b'and\x00zero bytes.\xff\x00..')
+        cls.oct_key = jwk.JWK.generate(kty='oct', size=256)
+        cls.oct_key_512 = jwk.JWK.generate(kty='oct', size=512)
+        cls.rsa_key = jwk.JWK.generate(kty='RSA', size=2048)
+        cls.ec_key = jwk.JWK.generate(kty='EC', crv='P-256')
+
+    def oneshot_signature(self, key, alg, payload):
+        s = jws.JWS(payload)
+        s.add_signature(key, protected={'alg': alg, 'b64': False,
+                                        'crit': ['b64']})
+        return s.objects['signature']
+
+    def stream_signature(self, key, alg, chunks, **kwargs):
+        s = jws.JWS()
+        s.sign_stream(key, chunks, protected={'alg': alg}, **kwargs)
+        return s
+
+    def test_protected_header_is_rfc7797(self):
+        s = self.stream_signature(self.oct_key, 'HS256', [self.payload])
+        protected = json_decode(s.objects['protected'])
+        self.assertEqual(protected['b64'], False)
+        self.assertIn('b64', protected['crit'])
+        self.assertEqual(protected['alg'], 'HS256')
+        # the payload is detached and never stored on the object
+        self.assertNotIn('payload', s.objects)
+        self.assertEqual(json_decode(s.serialize())['payload'], '')
+
+    def test_sign_stream_matches_oneshot(self):
+        # HS256 and RS256 are deterministic, so the streaming result
+        # must be byte-identical to the one-shot result
+        for key, alg in [(self.oct_key, 'HS256'),
+                         (self.oct_key_512, 'HS384'),
+                         (self.oct_key_512, 'HS512'),
+                         (self.rsa_key, 'RS256')]:
+            expected = self.oneshot_signature(key, alg, self.payload)
+            s = self.stream_signature(key, alg, split_payload(
+                self.payload, 7))
+            self.assertEqual(s.objects['signature'], expected)
+
+    def test_sign_stream_all_split_points(self):
+        expected = self.oneshot_signature(self.oct_key, 'HS256',
+                                          self.payload)
+        # single chunk, empty chunks and every two-chunk split point
+        chunkings = [[self.payload], [b''] + [self.payload] + [b'']]
+        chunkings += [[self.payload[:i], self.payload[i:]]
+                      for i in range(len(self.payload) + 1)]
+        for chunks in chunkings:
+            s = self.stream_signature(self.oct_key, 'HS256', chunks)
+            self.assertEqual(s.objects['signature'], expected)
+
+    def test_cross_verification(self):
+        for key, alg in [(self.oct_key, 'HS256'),
+                         (self.rsa_key, 'RS256'),
+                         (self.rsa_key, 'PS256'),
+                         (self.ec_key, 'ES256')]:
+            with self.subTest(alg=alg):
+                # stream-sign then one-shot verify
+                s = self.stream_signature(key, alg,
+                                          split_payload(self.payload, 5))
+                token = s.serialize()
+                v = jws.JWS()
+                v.deserialize(token)
+                v.verify(key, detached_payload=self.payload)
+                self.assertTrue(v.is_valid)
+
+                # one-shot sign then stream-verify
+                o = jws.JWS(self.payload)
+                o.add_signature(key, protected={'alg': alg, 'b64': False,
+                                                'crit': ['b64']})
+                o.detach_payload()
+                token = o.serialize()
+                v = jws.JWS()
+                v.deserialize(token)
+                v.verify_stream(key, split_payload(self.payload, 3))
+                self.assertTrue(v.is_valid)
+
+    def test_verify_stream_all_split_points(self):
+        s = self.stream_signature(self.oct_key, 'HS256', [self.payload])
+        token = s.serialize()
+        chunkings = [[self.payload]]
+        chunkings += [[self.payload[:i], self.payload[i:]]
+                      for i in range(len(self.payload) + 1)]
+        chunkings.append(split_payload(self.payload, 1))
+        for chunks in chunkings:
+            v = jws.JWS()
+            v.deserialize(token)
+            v.verify_stream(self.oct_key, chunks)
+            self.assertTrue(v.is_valid)
+
+    def test_verify_stream_compact_detached(self):
+        s = self.stream_signature(self.oct_key, 'HS256', [self.payload])
+        token = s.serialize(compact=True)
+        self.assertEqual(token.split('.')[1], '')
+        v = jws.JWS()
+        v.deserialize(token)
+        v.verify_stream(self.oct_key, split_payload(self.payload, 11))
+        self.assertTrue(v.is_valid)
+
+    def test_verify_stream_tampered_payload(self):
+        s = self.stream_signature(self.oct_key, 'HS256', [self.payload])
+        token = s.serialize()
+        tampered = bytearray(self.payload)
+        tampered[10] ^= 0x01
+        v = jws.JWS()
+        v.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify_stream(self.oct_key, split_payload(bytes(tampered), 4))
+        self.assertFalse(v.is_valid)
+
+    def test_verify_stream_source_raises(self):
+        s = self.stream_signature(self.oct_key, 'HS256', [self.payload])
+        token = s.serialize()
+        v = jws.JWS()
+        v.deserialize(token)
+        source = FailingChunkSource(split_payload(self.payload, 4))
+        with self.assertRaises(jws.InvalidJWSSignature):
+            v.verify_stream(self.oct_key, source)
+        # no valid state may be left behind
+        self.assertFalse(v.is_valid)
+
+    def test_sign_stream_source_raises(self):
+        s = jws.JWS()
+        source = FailingChunkSource(split_payload(self.payload, 4))
+        with self.assertRaises(RuntimeError):
+            s.sign_stream(self.oct_key, source,
+                          protected={'alg': 'HS256'})
+        self.assertNotIn('signature', s.objects)
+        self.assertFalse(s.is_valid)
+
+    def test_controlled_source_is_only_iterated(self):
+        chunks = split_payload(self.payload, 6)
+        source = ControlledChunkSource(chunks)
+        s = self.stream_signature(self.oct_key, 'HS256', source)
+        # the source was consumed exactly once, chunk by chunk
+        self.assertEqual(source.yielded, chunks)
+
+        token = s.serialize()
+        vsource = ControlledChunkSource(chunks)
+        v = jws.JWS()
+        v.deserialize(token)
+        v.verify_stream(self.oct_key, vsource)
+        self.assertEqual(vsource.yielded, chunks)
+        self.assertTrue(v.is_valid)
+
+    def test_stream_accepts_bytes_like_chunks(self):
+        chunks = [bytearray(self.payload[:9]),
+                  memoryview(self.payload)[9:]]
+        s = self.stream_signature(self.oct_key, 'HS256', chunks)
+        expected = self.oneshot_signature(self.oct_key, 'HS256',
+                                          self.payload)
+        self.assertEqual(s.objects['signature'], expected)
+
+    def test_stream_rejects_non_bytes_chunks(self):
+        with self.assertRaises(TypeError):
+            self.stream_signature(self.oct_key, 'HS256', ['text'])
+
+    def test_unsupported_algorithms_rejected(self):
+        ed_key = jwk.JWK.generate(kty='OKP', crv='Ed25519')
+        with self.assertRaises(jws.InvalidJWSOperation):
+            jws.JWS().sign_stream(ed_key, [self.payload],
+                                  protected={'alg': 'Ed25519'})
+        with self.assertRaises(jws.InvalidJWSOperation):
+            jws.JWS().sign_stream(ed_key, [self.payload],
+                                  protected={'alg': 'EdDSA'})
+        # 'none' is not even an allowed algorithm
+        with self.assertRaises(jws.InvalidJWSOperation):
+            jws.JWS().sign_stream(self.oct_key, [self.payload],
+                                  protected={'alg': 'none'})
+
+        # verification is rejected too
+        s = jws.JWS(self.payload)
+        s.add_signature(ed_key, protected={'alg': 'Ed25519', 'b64': False,
+                                           'crit': ['b64']})
+        s.detach_payload()
+        token = s.serialize()
+        v = jws.JWS()
+        v.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature) as cm:
+            v.verify_stream(ed_key, [self.payload])
+        self.assertIsInstance(cm.exception.__cause__,
+                              jws.InvalidJWSOperation)
+        self.assertFalse(v.is_valid)
+
+    def test_b64_header_enforced(self):
+        # signing with b64 true is rejected
+        with self.assertRaises(jws.InvalidJWSObject):
+            jws.JWS().sign_stream(
+                self.oct_key, [self.payload],
+                protected={'alg': 'HS256', 'b64': True, 'crit': ['b64']})
+        # crit may not drop the b64 entry; it is added automatically
+        s = self.stream_signature(self.oct_key, 'HS256', [self.payload])
+        self.assertIn('b64', json_decode(s.objects['protected'])['crit'])
+        # verifying a token with an encoded payload is rejected
+        o = jws.JWS(self.payload)
+        o.add_signature(self.oct_key, protected={'alg': 'HS256'})
+        token = o.serialize()
+        v = jws.JWS()
+        v.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSOperation):
+            v.verify_stream(self.oct_key, [self.payload])
+        self.assertFalse(v.is_valid)
+
+    def test_verify_stream_multiple_signatures_rejected(self):
+        s = jws.JWS(self.payload)
+        s.add_signature(self.oct_key, protected={'alg': 'HS256',
+                                                 'b64': False,
+                                                 'crit': ['b64']})
+        s.add_signature(self.oct_key, protected={'alg': 'HS256',
+                                                 'b64': False,
+                                                 'crit': ['b64']})
+        s.detach_payload()
+        token = s.serialize()
+        v = jws.JWS()
+        v.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSOperation):
+            v.verify_stream(self.oct_key, [self.payload])
+
+    def test_verify_stream_with_keyset(self):
+        key = jwk.JWK.generate(kty='oct', size=256, kid='stream-key')
+        keyset = jwk.JWKSet()
+        keyset.add(key)
+        keyset.add(jwk.JWK.generate(kty='oct', size=256, kid='other'))
+        s = jws.JWS()
+        s.sign_stream(key, [self.payload],
+                      protected={'alg': 'HS256'},
+                      header={'kid': 'stream-key'})
+        token = s.serialize()
+        v = jws.JWS()
+        v.deserialize(token)
+        v.verify_stream(keyset, split_payload(self.payload, 8))
+        self.assertTrue(v.is_valid)
+
+        # unknown kid raises JWKeyNotFound
+        v2 = jws.JWS()
+        v2.deserialize(token)
+        with self.assertRaises(JWKeyNotFound):
+            v2.verify_stream(jwk.JWKSet(), [self.payload])
+        self.assertFalse(v2.is_valid)
+
+    def test_sign_stream_alg_from_argument(self):
+        s = jws.JWS()
+        s.sign_stream(self.oct_key, [self.payload], alg='HS256')
+        protected = json_decode(s.objects['protected'])
+        self.assertNotIn('alg', protected)
+        v = jws.JWS()
+        v.deserialize(s.serialize())
+        v.verify_stream(self.oct_key, [self.payload], alg='HS256')
+        self.assertTrue(v.is_valid)
+
+    def test_sign_stream_alg_mismatch(self):
+        with self.assertRaises(ValueError):
+            jws.JWS().sign_stream(self.oct_key, [self.payload],
+                                  alg='HS384',
+                                  protected={'alg': 'HS256'})
+        with self.assertRaises(ValueError):
+            jws.JWS().sign_stream(self.oct_key, [self.payload])
+
+    def test_mixed_b64_rejected(self):
+        s = jws.JWS(self.payload)
+        s.add_signature(self.oct_key, protected={'alg': 'HS256'})
+        with self.assertRaises(jws.InvalidJWSObject):
+            s.sign_stream(self.oct_key, [self.payload],
+                          protected={'alg': 'HS256'})
+
+
 class TestOverloadedOperators(unittest.TestCase):
 
     def test_jws_equality(self):

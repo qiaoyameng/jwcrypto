@@ -18,6 +18,10 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: jwcrypto.jws.JWSStreamCore
+   :members:
+   :show-inheritance:
+
 Variables
 ---------
 
@@ -63,3 +67,23 @@ Verify a JWS token::
     >>> jwstoken.deserialize(sig)
     >>> jwstoken.verify(key)
     >>> payload = jwstoken.payload
+
+Sign a large payload as a detached JWS (RFC 7797) without loading it
+in memory. The protected header automatically carries ``"b64": false``
+and a ``crit`` entry for ``b64``; only algorithms that can be safely
+processed incrementally are accepted::
+    >>> from jwcrypto import jwk, jws
+    >>> key = jwk.JWK.generate(kty='oct', size=256)
+    >>> def chunks():
+    ...     yield b'My Integrity '
+    ...     yield b'protected message'
+    >>> jwstoken = jws.JWS()
+    >>> jwstoken.sign_stream(key, chunks(),
+    ...                      protected={"alg": "HS256"})
+    >>> sig = jwstoken.serialize()
+
+Verify a detached JWS against a payload read in chunks::
+    >>> jwstoken = jws.JWS()
+    >>> jwstoken.deserialize(sig)
+    >>> jwstoken.verify_stream(key, chunks())
+    True

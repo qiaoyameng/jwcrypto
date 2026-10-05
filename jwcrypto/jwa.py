@@ -146,6 +146,67 @@ class _RawJWS:
     def verify(self, key, payload, signature):
         raise NotImplementedError
 
+    def stream_signer(self, key):
+        """Returns an incremental signing context.
+
+        The returned context exposes an update(data) method that
+        accepts consecutive message chunks and a finalize() method
+        that returns the signature.
+        """
+        name = getattr(self, 'name', type(self).__name__)
+        raise NotImplementedError(
+            'The %s algorithm cannot be incrementally processed' % name)
+
+    def stream_verifier(self, key):
+        """Returns an incremental verification context.
+
+        The returned context exposes an update(data) method that
+        accepts consecutive message chunks and a verify(signature)
+        method that raises an exception if the signature does not
+        match.
+        """
+        name = getattr(self, 'name', type(self).__name__)
+        raise NotImplementedError(
+            'The %s algorithm cannot be incrementally processed' % name)
+
+
+class _StreamSigner:
+    """Incrementally hashes a message, then signs the digest.
+
+    Used for JWS algorithms defined as a signature over the hash of
+    the message (RSA and ECDSA based algorithms). The message is
+    hashed incrementally and the final digest is passed to the
+    signature primitive together with Prehashed, so the algorithm
+    semantics are identical to signing the whole message at once.
+    """
+
+    def __init__(self, hashfn, signfn):
+        self._hash = hashes.Hash(hashfn, backend=default_backend())
+        self._signfn = signfn
+
+    def update(self, data):
+        self._hash.update(data)
+
+    def finalize(self):
+        return self._signfn(self._hash.finalize())
+
+
+class _StreamVerifier:
+    """Incrementally hashes a message, then verifies the digest.
+
+    Companion of _StreamSigner for verification operations.
+    """
+
+    def __init__(self, hashfn, verifyfn):
+        self._hash = hashes.Hash(hashfn, backend=default_backend())
+        self._verifyfn = verifyfn
+
+    def update(self, data):
+        self._hash.update(data)
+
+    def verify(self, signature):
+        self._verifyfn(self._hash.finalize(), signature)
+
 
 class _RawHMAC(_RawJWS):
 
@@ -173,6 +234,20 @@ class _RawHMAC(_RawJWS):
         h = self._hmac_setup(vkey, payload)
         h.verify(signature)
 
+    def _hmac_ctx(self, key, op):
+        skey = base64url_decode(key.get_op_key(op))
+        # Ensure key size matches RFC 7518 requirements
+        if default_enforce_hmac_key_length and \
+                _bitsize(skey) < self.keysize:
+            raise InvalidJWEKeyLength(self.keysize, _bitsize(skey))
+        return hmac.HMAC(skey, self.hashfn, backend=self.backend)
+
+    def stream_signer(self, key):
+        return self._hmac_ctx(key, 'sign')
+
+    def stream_verifier(self, key):
+        return self._hmac_ctx(key, 'verify')
+
 
 class _RawRSA(_RawJWS):
     def __init__(self, padfn, hashfn):
@@ -186,6 +261,21 @@ class _RawRSA(_RawJWS):
     def verify(self, key, payload, signature):
         pkey = key.get_op_key('verify')
         pkey.verify(signature, payload, self.padfn, self.hashfn)
+
+    def stream_signer(self, key):
+        skey = key.get_op_key('sign')
+        return _StreamSigner(
+            self.hashfn,
+            lambda digest: skey.sign(digest, self.padfn,
+                                     ec_utils.Prehashed(self.hashfn)))
+
+    def stream_verifier(self, key):
+        pkey = key.get_op_key('verify')
+        return _StreamVerifier(
+            self.hashfn,
+            lambda digest, signature: pkey.verify(
+                signature, digest, self.padfn,
+                ec_utils.Prehashed(self.hashfn)))
 
 
 class _RawEC(_RawJWS):
@@ -211,6 +301,31 @@ class _RawEC(_RawJWS):
         enc_signature = ec_utils.encode_dss_signature(
             int(hexlify(r), 16), int(hexlify(s), 16))
         pkey.verify(enc_signature, payload, ec.ECDSA(self.hashfn))
+
+    def stream_signer(self, key):
+        skey = key.get_op_key('sign', self._curve)
+        size = skey.key_size
+
+        def _sign(digest):
+            signature = skey.sign(
+                digest, ec.ECDSA(ec_utils.Prehashed(self.hashfn)))
+            r, s = ec_utils.decode_dss_signature(signature)
+            return _encode_int(r, size) + _encode_int(s, size)
+
+        return _StreamSigner(self.hashfn, _sign)
+
+    def stream_verifier(self, key):
+        pkey = key.get_op_key('verify', self._curve)
+
+        def _verify(digest, signature):
+            r = signature[:len(signature) // 2]
+            s = signature[len(signature) // 2:]
+            enc_signature = ec_utils.encode_dss_signature(
+                int(hexlify(r), 16), int(hexlify(s), 16))
+            pkey.verify(enc_signature, digest,
+                        ec.ECDSA(ec_utils.Prehashed(self.hashfn)))
+
+        return _StreamVerifier(self.hashfn, _verify)
 
 
 class _RawNone(_RawJWS):

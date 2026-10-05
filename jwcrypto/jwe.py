@@ -49,6 +49,20 @@ default_allowed_algs = [
     'A128GCM', 'A192GCM', 'A256GCM']
 """Default allowed algorithms"""
 
+default_allowed_rewrap_algs = [
+    # Key management algorithms that wrap an independently generated CEK and
+    # may therefore transport the *same* CEK to an additional recipient.
+    # 'dir' and key agreement ('ECDH-ES') are excluded: the CEK is the key
+    # itself or freshly derived per recipient, so reusing it is not possible
+    # and the payload would have to be re-encrypted.
+    'RSA-OAEP', 'RSA-OAEP-256',
+    'A128KW', 'A192KW', 'A256KW',
+    'A128GCMKW', 'A192GCMKW', 'A256GCMKW',
+    'PBES2-HS256+A128KW', 'PBES2-HS384+A192KW', 'PBES2-HS512+A256KW',
+    'ECDH-ES+A128KW', 'ECDH-ES+A192KW', 'ECDH-ES+A256KW',
+]
+"""Key management algorithms allowed when re-wrapping an existing CEK"""
+
 
 # These have been moved to jwcrypto.common, maintain here for backwards compat
 InvalidCEKeyLength = common.InvalidCEKeyLength
@@ -256,6 +270,181 @@ class JWE:
                 self.objects.update(rec)
         else:
             self.objects['recipients'] = [rec]
+
+    def _get_aad(self):
+        aad = base64url_encode(self.objects.get('protected', ''))
+        if 'aad' in self.objects:
+            aad += '.' + base64url_encode(self.objects['aad'])
+        return aad.encode('utf-8')
+
+    def rewrap_recipient(self, old_key, new_key, header=None):
+        """Re-wrap the existing CEK for a new recipient.
+
+        Adds a recipient to an already serialized JWE without touching the
+        protected header, the external AAD, the IV, the ciphertext or the
+        authentication tag. The Content Encryption Key is recovered and
+        authenticated using an existing recipient's key, and then wrapped for
+        the new recipient with the key management algorithm found in
+        ``header``.
+
+        Only key management algorithms that wrap an independently generated
+        CEK are allowed (see :data:`default_allowed_rewrap_algs`); 'dir' and
+        plain 'ECDH-ES', which cannot transport a shared CEK, are rejected.
+
+        :param old_key: A (:class:`jwcrypto.jwk.JWK`) key (or a
+         :class:`jwcrypto.jwk.JWKSet`) able to decrypt one of the existing
+         recipients. The payload must authenticate with this key.
+        :param new_key: A (:class:`jwcrypto.jwk.JWK`) key for the recipient
+         being added.
+        :param header: A JSON string or dict with the per-recipient header;
+         it carries 'alg' unless that parameter is shared in the protected
+         header, and must not duplicate any protected or shared unprotected
+         header parameter.
+
+        :raises InvalidJWEOperation: if the token has no ciphertext, or the
+         existing or requested key management algorithm cannot re-use the
+         existing CEK.
+        :raises InvalidJWEData: if the payload fails authentication with
+         ``old_key``, or the new header conflicts with the shared headers.
+        :raises JWKeyNotFound: if ``old_key`` is a JWKSet without a usable key.
+        """
+
+        if 'ciphertext' not in self.objects:
+            raise InvalidJWEOperation("No available ciphertext")
+
+        if isinstance(header, dict):
+            header = json_encode(header)
+        new_rh = json_decode(header) if header else {}
+
+        # Collect the parameter names owned by the protected and shared
+        # unprotected headers; the per-recipient header must not repeat them.
+        shared_names = set()
+        if 'protected' in self.objects:
+            shared_names.update(json_decode(self.objects['protected']))
+        if 'unprotected' in self.objects:
+            shared_names.update(json_decode(self.objects['unprotected']))
+        conflicts = shared_names.intersection(new_rh)
+        if conflicts:
+            raise InvalidJWEData(
+                'Per-recipient header conflicts with shared header: %s'
+                % sorted(conflicts))
+
+        new_jh = self._get_jose_header(header)
+        new_algname = new_jh.get('alg', None)
+        if new_algname is None:
+            raise InvalidJWEData('Missing "alg" from new recipient header')
+        allowed_rewrap = default_allowed_rewrap_algs
+        if new_algname not in allowed_rewrap:
+            raise InvalidJWEOperation(
+                "Algorithm '%s' cannot re-wrap an existing CEK" % new_algname)
+        new_alg = self._jwa_keymgmt(new_algname)
+        new_enc = self._jwa_enc(new_jh.get('enc', None))
+
+        # Normalize the stored recipients into a plain list, including a
+        # flattened single-recipient token, without mutating the object yet.
+        if 'recipients' in self.objects:
+            recipients = list(self.objects['recipients'])
+        else:
+            rec = {}
+            if 'encrypted_key' in self.objects:
+                rec['encrypted_key'] = self.objects['encrypted_key']
+            if 'header' in self.objects:
+                rec['header'] = self.objects['header']
+            recipients = [rec]
+
+        aad = self._get_aad()
+
+        # Step 1: find an existing recipient whose key unwraps the CEK and
+        # whose content authentication tag verifies. Nothing is published
+        # until this succeeds.
+        old_keys = old_key if isinstance(old_key, JWKSet) else [old_key]
+        recovered_cek = None
+        recover_errors = []
+        keys_attempted = False
+        rewrapable_recipient = False
+        for rec in recipients:
+            jh = self._get_jose_header(rec.get('header', None))
+            self._check_crit(jh.get('crit', {}))
+            old_algname = jh.get('alg', None)
+            if old_algname is None:
+                raise InvalidJWEData('Missing "alg" from headers')
+            if old_algname not in allowed_rewrap:
+                # e.g. a 'dir' or 'ECDH-ES' recipient cannot supply a
+                # re-usable CEK; try the remaining recipients instead.
+                continue
+            rewrapable_recipient = True
+
+            candidate_keys = old_keys
+            if isinstance(old_key, JWKSet) and 'kid' in jh:
+                candidate_keys = old_key.get_keys(jh['kid']) or []
+
+            old_alg = self._jwa_keymgmt(old_algname)
+            old_enc = self._jwa_enc(jh.get('enc', None))
+            for k in candidate_keys:
+                keys_attempted = True
+                try:
+                    cek = old_alg.unwrap(
+                        k, old_enc.wrap_key_size,
+                        rec.get('encrypted_key', b''), jh)
+                    # Authenticate the payload: an attacker-controlled key
+                    # must never be able to introduce a new recipient.
+                    old_enc.decrypt(cek, aad, self.objects['iv'],
+                                    self.objects['ciphertext'],
+                                    self.objects['tag'])
+                except Exception as e:  # pylint: disable=broad-except
+                    recover_errors.append(repr(e))
+                    continue
+                recovered_cek = cek
+                break
+            if recovered_cek is not None:
+                break
+
+        if recovered_cek is None:
+            if isinstance(old_key, JWKSet) and not keys_attempted:
+                raise JWKeyNotFound('Key Not found in JWKSet')
+            if not rewrapable_recipient:
+                raise InvalidJWEOperation(
+                    'No existing recipient uses an algorithm that can '
+                    're-wrap an existing CEK')
+            raise InvalidJWEData(
+                'Failed to authenticate existing recipient: %s'
+                % recover_errors)
+
+        # Step 2: wrap the *same*, authenticated CEK for the new recipient.
+        wrapped = new_alg.wrap(new_key, new_enc.wrap_key_size,
+                               recovered_cek, new_jh)
+        if wrapped.get('cek') != recovered_cek:
+            raise InvalidJWEOperation(
+                "Algorithm '%s' did not re-use the existing CEK" % new_algname)
+
+        new_rec = {}
+        if header:
+            new_rec['header'] = header
+        if 'ek' in wrapped:
+            new_rec['encrypted_key'] = wrapped['ek']
+        if 'header' in wrapped:
+            nh = json_decode(new_rec.get('header', '{}'))
+            if shared_names.intersection(wrapped['header']):
+                raise InvalidJWEData(
+                    'Generated per-recipient header conflicts with shared '
+                    'header: %s' %
+                    sorted(shared_names.intersection(wrapped['header'])))
+            nh = self._merge_headers(nh, wrapped['header'])
+            new_rec['header'] = json_encode(nh)
+
+        # Step 3: publish the new recipient only after full success. Convert a
+        # flattened token to the general JSON serialization form, carrying the
+        # original ciphertext/iv/tag/AAD/protected bytes over untouched.
+        if 'recipients' not in self.objects:
+            first = {}
+            if 'encrypted_key' in self.objects:
+                first['encrypted_key'] = self.objects.pop('encrypted_key')
+            if 'header' in self.objects:
+                first['header'] = self.objects.pop('header')
+            self.objects['recipients'] = [first]
+
+        self.cek = recovered_cek
+        self.objects['recipients'].append(new_rec)
 
     def serialize(self, compact=False):
         """Serializes the object into a JWE token.

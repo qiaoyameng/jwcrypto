@@ -19,6 +19,8 @@ Variables
 
 .. autodata:: jwcrypto.jwe.default_allowed_algs
 
+.. autodata:: jwcrypto.jwe.default_allowed_rewrap_algs
+
 Exceptions
 ----------
 
@@ -96,3 +98,26 @@ Decrypt a JWE token::
     >>> jwetoken = jwe.JWE()
     >>> jwetoken.deserialize(enc, key=private_key)
     >>> payload = jwetoken.payload
+
+Re-wrapping for a new recipient
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An archived JWE can gain a recipient *without re-encrypting* the payload.
+The existing Content Encryption Key is recovered and authenticated with an
+existing recipient key, then wrapped for the new recipient. Only algorithms
+that wrap an independently generated CEK are permitted (see
+``default_allowed_rewrap_algs``); ``dir`` and plain ``ECDH-ES`` are rejected
+because they cannot transport the same CEK. The protected header, external
+AAD, IV, ciphertext and authentication tag are left untouched::
+
+    >>> old_key = jwk.JWK.generate(kty='oct', size=128, kid='alice')
+    >>> new_key = jwk.JWK.generate(kty='oct', size=256, kid='bob')
+    >>> token = jwe.JWE(payload.encode('utf-8'),
+    ...                  protected={'enc': 'A256GCM'})
+    >>> token.add_recipient(old_key, header={'alg': 'A128KW'})
+    >>> archived = token.serialize()
+    >>> rewrap = jwe.JWE()
+    >>> rewrap.deserialize(archived)
+    >>> rewrap.rewrap_recipient(old_key, new_key,
+    ...                         header={'alg': 'A256KW', 'kid': 'bob'})
+    >>> rewrap.serialize()

@@ -1698,6 +1698,201 @@ class TestJWE(unittest.TestCase):
         self.assertNotIn('recipients', e.objects)
         self.assertNotIn('recipients', e.serialize())
 
+    def _capture_serialized_parts(self, token):
+        d = json_decode(token)
+        parts = {}
+        for name in ('protected', 'iv', 'ciphertext', 'tag', 'aad'):
+            if name in d:
+                parts[name] = d[name]
+        return parts
+
+    def _recipient_count(self, jweobj):
+        d = json_decode(jweobj.serialize())
+        if 'recipients' in d:
+            return len(d['recipients'])
+        return 1
+
+    def test_rewrap_two_keywrap_algs_keeps_payload_bytes(self):
+        # General JSON JWE, CEK-wrapping algs live in per-recipient headers
+        old_kek = jwk.JWK.generate(kty='oct', size=128, kid='old')
+        new_kek_1 = jwk.JWK.generate(kty='oct', size=256, kid='new-1')
+        new_kek_2 = jwk.JWK.generate(kty='oct', size=128, kid='new-2')
+
+        plaintext = b're-wrap me, do not re-encrypt me'
+        aad = b'transport-envelope-context'
+        token = jwe.JWE(plaintext=plaintext,
+                        protected={'enc': 'A256GCM'},
+                        aad=aad)
+        token.add_recipient(old_kek, header={'alg': 'A128KW', 'kid': 'old'})
+        original = token.serialize()
+        parts = self._capture_serialized_parts(original)
+
+        # First re-wrap with A256KW
+        jwe1 = jwe.JWE()
+        jwe1.deserialize(original)
+        jwe1.rewrap_recipient(old_kek, new_kek_1,
+                              header={'alg': 'A256KW', 'kid': 'new-1'})
+        serialized1 = jwe1.serialize()
+        self.assertEqual(self._capture_serialized_parts(serialized1), parts)
+
+        # Second re-wrap with A128GCMKW (carries iv/tag in recipient header)
+        jwe2 = jwe.JWE()
+        jwe2.deserialize(serialized1)
+        jwe2.rewrap_recipient(old_kek, new_kek_2,
+                              header={'alg': 'A128GCMKW', 'kid': 'new-2'})
+        serialized2 = jwe2.serialize()
+        self.assertEqual(self._capture_serialized_parts(serialized2), parts)
+
+        data = json_decode(serialized2)
+        self.assertEqual(len(data['recipients']), 3)
+
+        # Every key recovers the exact same plaintext
+        for key in (old_kek, new_kek_1, new_kek_2):
+            d = jwe.JWE()
+            d.deserialize(serialized2, key)
+            self.assertEqual(d.payload, plaintext)
+
+    def test_rewrap_flattened_token_converts_to_general_form(self):
+        old_kek = jwk.JWK.generate(kty='oct', size=128, kid='old')
+        new_kek = jwk.JWK.generate(kty='oct', size=128, kid='new')
+
+        compactable = jwe.JWE(plaintext=b'flat',
+                              protected={'alg': 'A128KW',
+                                         'enc': 'A128CBC-HS256'})
+        compactable.add_recipient(old_kek)
+        compact = compactable.serialize(compact=True)
+        # Same token in flattened JSON form, to capture the raw parts
+        parts = self._capture_serialized_parts(compactable.serialize())
+
+        r = jwe.JWE()
+        r.deserialize(compact)
+        # 'alg' is shared in the protected header, new header must omit it
+        r.rewrap_recipient(old_kek, new_kek, header={'kid': 'new'})
+        out = r.serialize()
+        data = json_decode(out)
+        self.assertEqual(len(data['recipients']), 2)
+        self.assertEqual(self._capture_serialized_parts(out), parts)
+
+        for key in (old_kek, new_kek):
+            d = jwe.JWE()
+            d.deserialize(out, key)
+            self.assertEqual(d.payload, b'flat')
+
+    def test_rewrap_rejects_dir(self):
+        cek = jwk.JWK.generate(kty='oct', size=128)
+        new_key = jwk.JWK.generate(kty='oct', size=128)
+        token = jwe.JWE(plaintext=b'direct',
+                        protected={'alg': 'dir', 'enc': 'A128GCM'})
+        token.add_recipient(cek)
+        serialized = token.serialize(compact=True)
+
+        r = jwe.JWE()
+        r.deserialize(serialized)
+        with self.assertRaises((jwe.InvalidJWEOperation,
+                                jwe.InvalidJWEData)):
+            r.rewrap_recipient(cek, new_key, header={'alg': 'A128KW'})
+        # No recipient was published on failure
+        self.assertEqual(self._recipient_count(r), 1)
+
+    def test_rewrap_rejects_ecdh_es_new_alg(self):
+        old_kek = jwk.JWK.generate(kty='oct', size=128)
+        ecdh_key = jwk.JWK.generate(kty='EC', crv='P-256')
+        token = jwe.JWE(plaintext=b'ecdh-test',
+                        protected={'enc': 'A128GCM'})
+        token.add_recipient(old_kek, header={'alg': 'A128KW'})
+
+        r = jwe.JWE()
+        r.deserialize(token.serialize())
+        with self.assertRaises(jwe.InvalidJWEOperation):
+            r.rewrap_recipient(old_kek, ecdh_key,
+                               header={'alg': 'ECDH-ES'})
+        self.assertEqual(self._recipient_count(r), 1)
+
+    def test_rewrap_rejects_header_conflict(self):
+        old_kek = jwk.JWK.generate(kty='oct', size=128)
+        new_kek = jwk.JWK.generate(kty='oct', size=128)
+        token = jwe.JWE(plaintext=b'conflict',
+                        protected={'enc': 'A128GCM'})
+        token.add_recipient(old_kek, header={'alg': 'A128KW'})
+
+        r = jwe.JWE()
+        r.deserialize(token.serialize())
+        with self.assertRaises(jwe.InvalidJWEData):
+            r.rewrap_recipient(old_kek, new_kek,
+                               header={'alg': 'A128KW', 'enc': 'A256GCM'})
+        self.assertEqual(self._recipient_count(r), 1)
+
+    def test_rewrap_wrong_key_publishes_nothing(self):
+        old_kek = jwk.JWK.generate(kty='oct', size=128, kid='old')
+        attacker_kek = jwk.JWK.generate(kty='oct', size=128, kid='attacker')
+        new_kek = jwk.JWK.generate(kty='oct', size=128, kid='new')
+        token = jwe.JWE(plaintext=b'authenticated-only',
+                        protected={'enc': 'A128GCM'})
+        token.add_recipient(old_kek, header={'alg': 'A128KW', 'kid': 'old'})
+
+        r = jwe.JWE()
+        r.deserialize(token.serialize())
+        with self.assertRaises(jwe.InvalidJWEData):
+            r.rewrap_recipient(attacker_kek, new_kek,
+                               header={'alg': 'A128KW', 'kid': 'new'})
+        self.assertEqual(self._recipient_count(r), 1)
+        self.assertIsNone(r.cek)
+
+    def test_rewrap_with_keyset_old_key(self):
+        old_kek = jwk.JWK.generate(kty='oct', size=256, kid='old')
+        extra = jwk.JWK.generate(kty='oct', size=256, kid='extra')
+        new_kek = jwk.JWK.generate(kty='RSA', size=2048, kid='rsa-new')
+        ks = jwk.JWKSet()
+        ks.add(old_kek)
+        ks.add(extra)
+
+        token = jwe.JWE(plaintext=b'keyset',
+                        protected={'enc': 'A128GCM'})
+        token.add_recipient(old_kek, header={'alg': 'A256KW', 'kid': 'old'})
+        serialized = token.serialize()
+        parts = self._capture_serialized_parts(serialized)
+
+        r = jwe.JWE()
+        r.deserialize(serialized)
+        r.rewrap_recipient(ks, new_kek,
+                           header={'alg': 'RSA-OAEP', 'kid': 'rsa-new'})
+        out = r.serialize()
+        self.assertEqual(self._capture_serialized_parts(out), parts)
+
+        for key in (old_kek, new_kek):
+            d = jwe.JWE()
+            d.deserialize(out, key)
+            self.assertEqual(d.payload, b'keyset')
+
+    def test_rewrap_mixed_dir_and_keywrap_recipient(self):
+        # A token may carry a 'dir' recipient plus a key-wrap recipient; the
+        # dir recipient is skipped while the KW recipient supplies the CEK.
+        direct_cek = jwk.JWK.generate(kty='oct', size=128, kid='dir-cek')
+        wrap_kek = jwk.JWK.generate(kty='oct', size=128, kid='wrap-kek')
+        new_kek = jwk.JWK.generate(kty='oct', size=128, kid='new')
+
+        # Build the general (multi-recipient) token directly: first the 'dir'
+        # recipient establishes the CEK, then a key-wrap recipient is added.
+        token = jwe.JWE(plaintext=b'mixed',
+                        protected={'enc': 'A128GCM'})
+        token.add_recipient(direct_cek, header={'alg': 'dir',
+                                                'kid': 'dir-cek'})
+        token.add_recipient(wrap_kek, header={'alg': 'A128KW',
+                                              'kid': 'wrap-kek'})
+        serialized = token.serialize()
+        self.assertEqual(len(json_decode(serialized)['recipients']), 2)
+
+        r = jwe.JWE()
+        r.deserialize(serialized)
+        r.rewrap_recipient(wrap_kek, new_kek,
+                           header={'alg': 'A128GCMKW', 'kid': 'new'})
+        out = r.serialize()
+        self.assertEqual(len(json_decode(out)['recipients']), 3)
+
+        d = jwe.JWE()
+        d.deserialize(out, new_kek)
+        self.assertEqual(d.payload, b'mixed')
+
 
 MMA_vector_key = jwk.JWK(**E_A2_key)
 MMA_vector_ok_cek =  \

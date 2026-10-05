@@ -3,6 +3,7 @@
 from __future__ import unicode_literals
 
 import copy
+import tracemalloc
 import unittest
 
 from cryptography.hazmat.backends import default_backend
@@ -1264,6 +1265,276 @@ class TestJWS(unittest.TestCase):
         s3 = jws.JWS()
         with self.assertRaises(JWKeyNotFound):
             s3.deserialize(serialized, ks_swapped)
+
+
+# A payload full of zero bytes and dots, to make sure chunk boundaries
+# do not affect the signing input
+STREAM_PAYLOAD = b'\x00.\x00\x00.start.\x00middle..\x00\x00.end.\x00' + \
+    bytes(bytearray(range(256)))
+
+STREAM_PROTECTED = {'alg': 'HS256', 'b64': False, 'crit': ['b64']}
+
+
+def _stream_chunks(payload, size):
+    return [payload[i:i + size] for i in range(0, len(payload), size)]
+
+
+class ControlledChunkSource:
+    """An iterator-only payload source.
+
+    It deliberately offers no read/seek/tell/len interface, so tests
+    fail if the implementation tries to treat the source as a file
+    object, and records how many chunks were consumed.
+    """
+
+    def __init__(self, chunks, fail_at=None):
+        self._chunks = chunks
+        self._fail_at = fail_at
+        self.consumed = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._fail_at is not None and self.consumed == self._fail_at:
+            raise OSError('payload source failed')
+        if self.consumed >= len(self._chunks):
+            raise StopIteration
+        chunk = self._chunks[self.consumed]
+        self.consumed += 1
+        return chunk
+
+
+class TestJWSStreaming(unittest.TestCase):
+
+    def test_stream_core_matches_oneshot(self):
+        for alg in ['HS256', 'HS384', 'HS512']:
+            key = jwk.JWK.generate(kty='oct', size=int(alg[2:]))
+            p = json_encode(dict(STREAM_PROTECTED, alg=alg))
+            oneshot = jws.JWSCore(alg, key, p, STREAM_PAYLOAD)
+            reference = oneshot.sign()
+            sig = None
+            for size in [1, 2, 3, 7, 64, 1024, len(STREAM_PAYLOAD),
+                         len(STREAM_PAYLOAD) + 1]:
+                chunks = _stream_chunks(STREAM_PAYLOAD, size)
+                source = ControlledChunkSource(chunks)
+                c = jws.JWSCoreStreaming(alg, key, p)
+                sig = c.sign(source)
+                # HMAC signatures are deterministic
+                self.assertEqual(sig['signature'], reference['signature'])
+                self.assertEqual(source.consumed, len(chunks))
+                # stream-verify the one-shot signature
+                v = jws.JWSCoreStreaming(alg, key, p)
+                self.assertTrue(v.verify(
+                    ControlledChunkSource(chunks),
+                    base64url_decode(reference['signature'])))
+            # one-shot verify of the streamed signature
+            oneshot.verify(base64url_decode(sig['signature']))
+
+    def test_stream_core_empty_payload(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        protected = json_encode(STREAM_PROTECTED)
+        oneshot = jws.JWSCore('HS256', key, protected, b'')
+        reference = oneshot.sign()
+        c = jws.JWSCoreStreaming('HS256', key, protected)
+        sig = c.sign(ControlledChunkSource([]))
+        self.assertEqual(sig['signature'], reference['signature'])
+        v = jws.JWSCoreStreaming('HS256', key, protected)
+        self.assertTrue(v.verify(ControlledChunkSource([]),
+                                 base64url_decode(reference['signature'])))
+
+    def test_stream_jws_roundtrip(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        s = jws.JWS()
+        s.add_signature_stream(
+            key, ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 5)),
+            protected=STREAM_PROTECTED)
+        token = s.serialize()
+        for size in [1, 4, 100, len(STREAM_PAYLOAD)]:
+            t = jws.JWS()
+            t.deserialize(token)
+            t.verify_stream(
+                key,
+                ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, size)))
+            self.assertTrue(t.is_valid)
+
+    def test_stream_cross_verify_with_oneshot(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        # one-shot sign, streamed verify
+        s = jws.JWS(payload=STREAM_PAYLOAD)
+        s.add_signature(key, protected=STREAM_PROTECTED)
+        s.detach_payload()
+        token = s.serialize()
+        t = jws.JWS()
+        t.deserialize(token)
+        t.verify_stream(
+            key, ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 7)))
+        self.assertTrue(t.is_valid)
+        # streamed sign, one-shot verify with detached payload
+        s2 = jws.JWS()
+        s2.add_signature_stream(
+            key, ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 13)),
+            protected=STREAM_PROTECTED)
+        token2 = s2.serialize()
+        t2 = jws.JWS()
+        t2.deserialize(token2)
+        t2.verify(key, detached_payload=STREAM_PAYLOAD)
+        self.assertTrue(t2.is_valid)
+
+    def test_stream_source_is_not_treated_as_file(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        chunks = _stream_chunks(STREAM_PAYLOAD, 3)
+        # The source has no seek/read/tell/len; any such access would
+        # raise AttributeError and fail the test
+        source = ControlledChunkSource(chunks)
+        s = jws.JWS()
+        s.add_signature_stream(key, source, protected=STREAM_PROTECTED)
+        self.assertEqual(source.consumed, len(chunks))
+        token = s.serialize()
+        vsource = ControlledChunkSource(chunks)
+        t = jws.JWS()
+        t.deserialize(token)
+        t.verify_stream(key, vsource)
+        self.assertEqual(vsource.consumed, len(chunks))
+        self.assertTrue(t.is_valid)
+
+    def test_stream_sign_memory_bounded(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        chunk = bytes(bytearray(range(256))) * 512  # 128 KiB
+        count = 64  # 8 MiB total, generated lazily
+
+        def source():
+            for _ in range(count):
+                yield chunk
+
+        c = jws.JWSCoreStreaming('HS256', key,
+                                 json_encode(STREAM_PROTECTED))
+        tracemalloc.start()
+        try:
+            c.sign(source())
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # Concatenating the full payload would require > 8 MiB
+        self.assertLess(peak, 4 * 1024 * 1024)
+
+    def test_stream_verify_failure_leaves_no_valid_state(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        other = jwk.JWK.generate(kty='oct', size=256)
+        s = jws.JWS()
+        s.add_signature_stream(
+            key, ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 8)),
+            protected=STREAM_PROTECTED)
+        token = s.serialize()
+        # wrong key
+        t = jws.JWS()
+        t.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            t.verify_stream(
+                other,
+                ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 8)))
+        self.assertFalse(t.is_valid)
+        # tampered payload
+        tampered = bytearray(STREAM_PAYLOAD)
+        tampered[10] ^= 0xFF
+        t2 = jws.JWS()
+        t2.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            t2.verify_stream(
+                key,
+                ControlledChunkSource(_stream_chunks(bytes(tampered), 8)))
+        self.assertFalse(t2.is_valid)
+
+    def test_stream_source_error_leaves_no_valid_state(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        chunks = _stream_chunks(STREAM_PAYLOAD, 8)
+        s = jws.JWS()
+        s.add_signature_stream(key, ControlledChunkSource(chunks),
+                               protected=STREAM_PROTECTED)
+        token = s.serialize()
+        t = jws.JWS()
+        t.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSSignature):
+            t.verify_stream(key, ControlledChunkSource(chunks, fail_at=2))
+        self.assertFalse(t.is_valid)
+        self.assertNotEqual(t.verifylog, [])
+
+    def test_stream_sign_source_error(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        chunks = _stream_chunks(STREAM_PAYLOAD, 8)
+        s = jws.JWS()
+        with self.assertRaises(OSError):
+            s.add_signature_stream(
+                key, ControlledChunkSource(chunks, fail_at=1),
+                protected=STREAM_PROTECTED)
+        self.assertNotIn('signature', s.objects)
+        self.assertFalse(s.is_valid)
+
+    def test_stream_rejects_non_streamable_algs(self):
+        rsakey = jwk.JWK.generate(kty='RSA', size=2048)
+        eckey = jwk.JWK.generate(kty='EC', crv='P-256')
+        chunks = ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 16))
+        for key, alg in [(rsakey, 'RS256'), (rsakey, 'PS256'),
+                         (eckey, 'ES256')]:
+            protected = {'alg': alg, 'b64': False, 'crit': ['b64']}
+            with self.assertRaises(jws.InvalidJWSOperation):
+                jws.JWSCoreStreaming(alg, key, json_encode(protected))
+            s = jws.JWS()
+            with self.assertRaises(jws.InvalidJWSOperation):
+                s.add_signature_stream(key, chunks, protected=protected)
+        # the source must remain untouched when the algorithm is rejected
+        self.assertEqual(chunks.consumed, 0)
+
+    def test_stream_requires_unencoded_payload_header(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        chunks = ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 16))
+        bad_headers = [
+            {'alg': 'HS256'},  # no b64
+            {'alg': 'HS256', 'b64': True, 'crit': ['b64']},  # encoded
+            {'alg': 'HS256', 'b64': False},  # b64 not critical
+        ]
+        for protected in bad_headers:
+            with self.assertRaises(jws.InvalidJWSObject):
+                jws.JWSCoreStreaming('HS256', key, json_encode(protected))
+            s = jws.JWS()
+            with self.assertRaises(jws.InvalidJWSObject):
+                s.add_signature_stream(key, chunks, protected=protected)
+        self.assertEqual(chunks.consumed, 0)
+
+    def test_stream_rejects_object_payload(self):
+        key = jwk.JWK.generate(kty='oct', size=256)
+        s = jws.JWS(payload=STREAM_PAYLOAD)
+        with self.assertRaises(jws.InvalidJWSOperation):
+            s.add_signature_stream(
+                key, ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 8)),
+                protected=STREAM_PROTECTED)
+        # verify_stream on a token carrying a payload
+        t = jws.JWS(payload=STREAM_PAYLOAD)
+        t.add_signature(key, protected=STREAM_PROTECTED)
+        with self.assertRaises(jws.InvalidJWSOperation):
+            t.verify_stream(
+                key,
+                ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 8)))
+        self.assertFalse(t.is_valid)
+
+    def test_stream_verify_rejects_multiple_signatures(self):
+        key1 = jwk.JWK.generate(kty='oct', size=256)
+        key2 = jwk.JWK.generate(kty='oct', size=256)
+        s = jws.JWS()
+        s.add_signature_stream(
+            key1, ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 8)),
+            protected=STREAM_PROTECTED)
+        s.add_signature_stream(
+            key2, ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 8)),
+            protected=STREAM_PROTECTED)
+        token = s.serialize()
+        t = jws.JWS()
+        t.deserialize(token)
+        with self.assertRaises(jws.InvalidJWSOperation):
+            t.verify_stream(
+                key1,
+                ControlledChunkSource(_stream_chunks(STREAM_PAYLOAD, 8)))
+        self.assertFalse(t.is_valid)
 
 
 E_A1_plaintext = \

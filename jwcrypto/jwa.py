@@ -140,37 +140,61 @@ def _decode_int(n):
 
 class _RawJWS:
 
+    streamable = False
+    """Whether the algorithm can process the message incrementally"""
+
     def sign(self, key, payload):
         raise NotImplementedError
 
     def verify(self, key, payload, signature):
+        raise NotImplementedError
+
+    def sign_stream(self, key, chunks):
+        raise NotImplementedError
+
+    def verify_stream(self, key, chunks, signature):
         raise NotImplementedError
 
 
 class _RawHMAC(_RawJWS):
 
     keysize = None
+    streamable = True
 
     def __init__(self, hashfn):
         self.backend = default_backend()
         self.hashfn = hashfn
 
-    def _hmac_setup(self, key, payload):
+    def _hmac_setup(self, key):
         # Ensure key size matches RFC 7518 requirements
         if default_enforce_hmac_key_length and _bitsize(key) < self.keysize:
             raise InvalidJWEKeyLength(self.keysize, _bitsize(key))
-        h = hmac.HMAC(key, self.hashfn, backend=self.backend)
-        h.update(payload)
-        return h
+        return hmac.HMAC(key, self.hashfn, backend=self.backend)
 
     def sign(self, key, payload):
         skey = base64url_decode(key.get_op_key('sign'))
-        h = self._hmac_setup(skey, payload)
+        h = self._hmac_setup(skey)
+        h.update(payload)
         return h.finalize()
 
     def verify(self, key, payload, signature):
         vkey = base64url_decode(key.get_op_key('verify'))
-        h = self._hmac_setup(vkey, payload)
+        h = self._hmac_setup(vkey)
+        h.update(payload)
+        h.verify(signature)
+
+    def sign_stream(self, key, chunks):
+        skey = base64url_decode(key.get_op_key('sign'))
+        h = self._hmac_setup(skey)
+        for chunk in chunks:
+            h.update(chunk)
+        return h.finalize()
+
+    def verify_stream(self, key, chunks, signature):
+        vkey = base64url_decode(key.get_op_key('verify'))
+        h = self._hmac_setup(vkey)
+        for chunk in chunks:
+            h.update(chunk)
         h.verify(signature)
 
 

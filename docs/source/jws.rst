@@ -18,6 +18,10 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: jwcrypto.jws.JWSCoreStreaming
+   :members:
+   :show-inheritance:
+
 Variables
 ---------
 
@@ -63,3 +67,27 @@ Verify a JWS token::
     >>> jwstoken.deserialize(sig)
     >>> jwstoken.verify(key)
     >>> payload = jwstoken.payload
+
+Sign a large payload as a detached, unencoded payload (RFC 7797) by
+streaming it in chunks, without ever holding it whole in memory:
+
+.. code-block:: python
+
+    from jwcrypto import jwk, jws
+
+    key = jwk.JWK.generate(kty='oct', size=256)
+    protected = {"alg": "HS256", "b64": False, "crit": ["b64"]}
+    jwstoken = jws.JWS()
+    with open('large.bin', 'rb') as f:
+        jwstoken.add_signature_stream(
+            key, iter(lambda: f.read(65536), b''), protected=protected)
+    sig = jwstoken.serialize()
+
+Verify a JWS token with a detached payload streamed in chunks:
+
+.. code-block:: python
+
+    jwstoken = jws.JWS()
+    jwstoken.deserialize(sig)
+    with open('large.bin', 'rb') as f:
+        jwstoken.verify_stream(key, iter(lambda: f.read(65536), b''))

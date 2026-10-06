@@ -4,6 +4,7 @@ from jwcrypto.common import JWException, JWKeyNotFound
 from jwcrypto.common import JWSEHeaderParameter, JWSEHeaderRegistry
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import json_decode, json_encode
+from jwcrypto.extkey import ExternalKey
 from jwcrypto.jwa import JWA
 from jwcrypto.jwk import JWK, JWKSet
 
@@ -157,6 +158,13 @@ class JWSCore:
 
     def sign(self):
         """Generates a signature"""
+        if isinstance(self.key, ExternalKey):
+            sigin = b'.'.join([self.protected.encode('utf-8'),
+                               self.payload])
+            signature = self.key.sign(self.alg, sigin)
+            return {'protected': self.protected,
+                    'payload': self.payload,
+                    'signature': base64url_encode(signature)}
         if not isinstance(self.key, JWK):
             raise ValueError('key is not a JWK object')
         sigin = b'.'.join([self.protected.encode('utf-8'),

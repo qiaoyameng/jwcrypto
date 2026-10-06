@@ -7,6 +7,7 @@ from jwcrypto.common import JWKeyNotFound
 from jwcrypto.common import JWSEHeaderParameter, JWSEHeaderRegistry
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import json_decode, json_encode
+from jwcrypto.externalkey import ExternalKeyAdapter
 from jwcrypto.jwa import JWA
 from jwcrypto.jwk import JWKSet
 
@@ -226,7 +227,9 @@ class JWE:
         if header:
             rec['header'] = header
 
-        wrapped = alg.wrap(key, enc.wrap_key_size, self.cek, jh)
+        wrap_key = key.jwk if isinstance(key, ExternalKeyAdapter) \
+            else key
+        wrapped = alg.wrap(wrap_key, enc.wrap_key_size, self.cek, jh)
         self.cek = wrapped['cek']
 
         if 'ek' in wrapped:
@@ -356,7 +359,10 @@ class JWE:
 
     def _unwrap_decrypt(self, alg, enc, key, enckey, header,
                         aad, iv, ciphertext, tag):
-        cek = alg.unwrap(key, enc.wrap_key_size, enckey, header)
+        if isinstance(key, ExternalKeyAdapter):
+            cek = key.unwrap(alg.name, enckey, enc.wrap_key_size, header)
+        else:
+            cek = alg.unwrap(key, enc.wrap_key_size, enckey, header)
         data = enc.decrypt(cek, aad, iv, ciphertext, tag)
         self.decryptlog.append('Success')
         self.cek = cek

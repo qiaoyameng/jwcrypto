@@ -4,6 +4,7 @@ from jwcrypto.common import JWException, JWKeyNotFound
 from jwcrypto.common import JWSEHeaderParameter, JWSEHeaderRegistry
 from jwcrypto.common import base64url_decode, base64url_encode
 from jwcrypto.common import json_decode, json_encode
+from jwcrypto.externalkey import ExternalKeyAdapter
 from jwcrypto.jwa import JWA
 from jwcrypto.jwk import JWK, JWKSet
 
@@ -157,11 +158,14 @@ class JWSCore:
 
     def sign(self):
         """Generates a signature"""
-        if not isinstance(self.key, JWK):
-            raise ValueError('key is not a JWK object')
         sigin = b'.'.join([self.protected.encode('utf-8'),
                            self.payload])
-        signature = self.engine.sign(self.key, sigin)
+        if isinstance(self.key, ExternalKeyAdapter):
+            signature = self.key.sign(self.alg, sigin, self.header)
+        else:
+            if not isinstance(self.key, JWK):
+                raise ValueError('key is not a JWK object')
+            signature = self.engine.sign(self.key, sigin)
         return {'protected': self.protected,
                 'payload': self.payload,
                 'signature': base64url_encode(signature)}
@@ -177,7 +181,11 @@ class JWSCore:
         try:
             sigin = b'.'.join([self.protected.encode('utf-8'),
                                self.payload])
-            self.engine.verify(self.key, sigin, signature)
+            if isinstance(self.key, ExternalKeyAdapter):
+                verify_key = self.key.jwk
+            else:
+                verify_key = self.key
+            self.engine.verify(verify_key, sigin, signature)
         except Exception as e:  # pylint: disable=broad-except
             raise InvalidJWSSignature('Verification failed') from e
         return True
@@ -301,7 +309,7 @@ class JWS:
 
         # the following will verify the "alg" is supported and the signature
         # verifies
-        if isinstance(key, JWK):
+        if isinstance(key, (JWK, ExternalKeyAdapter)):
             signer = JWSCore(resulting_alg, key, protected,
                              payload, self._allowed_algs)
             signer.verify(signature)

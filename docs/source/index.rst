@@ -20,6 +20,7 @@ JWCrypto uses the Cryptography_ package for all the crypto functions.
    :caption: Public APIs
 
    jwk
+   externalkey
    jws
    jwe
    jwt

@@ -10,6 +10,7 @@ from jwcrypto.common import JWException, JWKeyNotFound
 from jwcrypto.common import json_decode, json_encode
 from jwcrypto.jwe import JWE
 from jwcrypto.jwe import default_allowed_algs as jwe_algs
+from jwcrypto.externalkey import ExternalKeyAdapter
 from jwcrypto.jwk import JWK, JWKSet
 from jwcrypto.jws import JWS
 from jwcrypto.jws import default_allowed_algs as jws_algs
@@ -316,13 +317,20 @@ class JWT:
             if "enc" in json_decode(self._header):
                 self._expected_type = "JWE"
         if self._expected_type is None and key is not None:
-            if isinstance(key, JWK):
+            if isinstance(key, ExternalKeyAdapter):
+                if key.signing_algs and not key.unwrapping_algs:
+                    self._expected_type = "JWS"
+                elif key.unwrapping_algs and not key.signing_algs:
+                    self._expected_type = "JWE"
+                else:
+                    key = key.jwk
+            if self._expected_type is None and isinstance(key, JWK):
                 use = key.get('use')
                 if use == 'sig':
                     self._expected_type = "JWS"
                 elif use == 'enc':
                     self._expected_type = "JWE"
-            elif isinstance(key, JWKSet):
+            elif self._expected_type is None and isinstance(key, JWKSet):
                 all_use = None
                 # we can infer only if all keys are of the same type
                 for k in key:
